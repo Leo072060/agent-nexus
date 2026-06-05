@@ -1,43 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract SellerRegistry {
-    struct Seller {
-        bool registered;
-        bool active;
-        string sellerURI;
-        uint256 price;
-        string contentURI;
-        bytes32 contentHash;
-        uint256 deliveryTimeout;
-    }
+import "./MarketStorage.sol";
 
-    error AlreadyRegistered();
-    error NotRegistered();
-    error ZeroAddress();
-    error InvalidContentHash();
-    error InvalidDeliveryTimeout();
-    error ValidatorAlreadySupported();
-    error ValidatorNotSupported();
-
-    event SellerRegistered(address indexed seller, string sellerURI);
-    event SellerURIUpdated(address indexed seller, string sellerURI);
-    event SellerActiveUpdated(address indexed seller, bool active);
-    event SellerProductUpdated(
-        address indexed seller,
-        uint256 price,
-        string contentURI,
-        bytes32 contentHash,
-        uint256 deliveryTimeout
-    );
-    event ValidatorAdded(address indexed seller, address indexed validator);
-    event ValidatorRemoved(address indexed seller, address indexed validator);
-
-    mapping(address => Seller) private sellers;
-    mapping(address => address[]) private sellerValidators;
-    mapping(address => mapping(address => bool)) private supportsValidator;
-    address[] private sellerList;
-
+abstract contract SellerModule is MarketStorage {
     modifier onlyRegisteredSeller() {
         if (!sellers[msg.sender].registered) revert NotRegistered();
         _;
@@ -113,12 +79,12 @@ contract SellerRegistry {
 
         supportsValidator[msg.sender][validator] = false;
 
-        address[] storage validators = sellerValidators[msg.sender];
-        uint256 validatorCount = validators.length;
+        address[] storage supportedValidators = sellerValidators[msg.sender];
+        uint256 validatorCount = supportedValidators.length;
         for (uint256 i; i < validatorCount; i++) {
-            if (validators[i] == validator) {
-                validators[i] = validators[validatorCount - 1];
-                validators.pop();
+            if (supportedValidators[i] == validator) {
+                supportedValidators[i] = supportedValidators[validatorCount - 1];
+                supportedValidators.pop();
                 break;
             }
         }

@@ -1,114 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-interface ISellerRegistry {
-    function isSellerActive(address seller) external view returns (bool);
-    function getSellerPrice(address seller) external view returns (uint256);
-    function getSellerContentHash(address seller) external view returns (bytes32);
-    function getSellerDeliveryTimeout(address seller) external view returns (uint256);
-    function isValidatorSupported(address seller, address validator) external view returns (bool);
-}
+import "./MarketStorage.sol";
 
-interface IValidatorRegistry {
-    function isValidatorActive(address validator) external view returns (bool);
-    function getValidator(address validator)
-        external
-        view
-        returns (
-            bool registered,
-            bool active,
-            string memory validatorURI,
-            uint256 fee,
-            uint256 responseTimeout
-        );
-}
-
-contract OrderRegistry {
-    enum OrderStatus {
-        None,
-        PendingSeller,
-        PendingValidator,
-        Created,
-        DeliveryCommitted,
-        Disputed,
-        Released,
-        ApprovalExpiredRefunded,
-        DeliveryExpiredRefunded,
-        ResolvedToSeller,
-        ResolvedToBuyer
-    }
-
-    struct Order {
-        address buyer;
-        address seller;
-        address validator;
-        uint256 amount;
-        uint256 validatorFee;
-        bytes32 listingHash;
-        bytes32 requestHash;
-        bytes32 deliveryHash;
-        bytes32 resolutionHash;
-        uint256 createdAt;
-        uint256 approvalDeadline;
-        uint256 deliveryDeadline;
-        uint256 responseDeadline;
-        OrderStatus status;
-    }
-
-    error ZeroAddress();
-    error InvalidTimeout();
-    error InvalidPayment();
-    error InvalidHash();
-    error InvalidStatus();
-    error Unauthorized();
-    error SellerUnavailable();
-    error ValidatorUnavailable();
-    error ValidatorNotSupported();
-    error DeliveryExpired();
-    error DeliveryNotExpired();
-    error ApprovalExpired();
-    error ApprovalNotExpired();
-    error ResolutionExpired();
-    error TransferFailed();
-
-    event OrderCreated(
-        uint256 indexed orderId,
-        address indexed buyer,
-        address indexed seller,
-        address validator,
-        uint256 amount,
-        uint256 validatorFee,
-        bytes32 listingHash,
-        bytes32 requestHash,
-        uint256 approvalDeadline
-    );
-    event SellerConfirmed(uint256 indexed orderId);
-    event ValidatorConfirmed(uint256 indexed orderId, uint256 deliveryDeadline);
-    event DeliveryCommitted(
-        uint256 indexed orderId,
-        bytes32 deliveryHash
-    );
-    event DeliveryAccepted(uint256 indexed orderId);
-    event DisputeOpened(uint256 indexed orderId, uint256 responseDeadline);
-    event DisputeResolved(uint256 indexed orderId, bool releaseToSeller, bytes32 resolutionHash);
-    event ApprovalExpiredRefunded(uint256 indexed orderId);
-    event DeliveryExpiredRefunded(uint256 indexed orderId);
-
-    ISellerRegistry public immutable sellerRegistry;
-    IValidatorRegistry public immutable validatorRegistry;
-
-    uint256 private orderCount;
-    mapping(uint256 => Order) private orders;
-
-    constructor(address sellerRegistry_, address validatorRegistry_) {
-        if (sellerRegistry_ == address(0) || validatorRegistry_ == address(0)) {
-            revert ZeroAddress();
-        }
-
-        sellerRegistry = ISellerRegistry(sellerRegistry_);
-        validatorRegistry = IValidatorRegistry(validatorRegistry_);
-    }
-
+abstract contract OrderModule is MarketStorage {
     function createOrder(
         address seller,
         address validator,
@@ -118,15 +13,15 @@ contract OrderRegistry {
         if (seller == address(0) || validator == address(0)) revert ZeroAddress();
         if (requestHash == bytes32(0)) revert InvalidHash();
         if (approvalTimeout == 0) revert InvalidTimeout();
-        if (!sellerRegistry.isSellerActive(seller)) revert SellerUnavailable();
-        if (!validatorRegistry.isValidatorActive(validator)) revert ValidatorUnavailable();
-        if (!sellerRegistry.isValidatorSupported(seller, validator)) revert ValidatorNotSupported();
+        if (!sellers[seller].registered || !sellers[seller].active) revert SellerUnavailable();
+        if (!validators[validator].registered || !validators[validator].active) revert ValidatorUnavailable();
+        if (!supportsValidator[seller][validator]) revert ValidatorNotSupported();
 
-        uint256 amount = sellerRegistry.getSellerPrice(seller);
-        bytes32 listingHash = sellerRegistry.getSellerContentHash(seller);
+        uint256 amount = sellers[seller].price;
+        bytes32 listingHash = sellers[seller].contentHash;
         if (listingHash == bytes32(0)) revert InvalidHash();
 
-        (, , , uint256 validatorFee, ) = validatorRegistry.getValidator(validator);
+        uint256 validatorFee = validators[validator].fee;
         if (msg.value != amount + validatorFee) revert InvalidPayment();
 
         orderId = ++orderCount;
@@ -168,7 +63,7 @@ contract OrderRegistry {
         if (msg.sender != order.validator) revert Unauthorized();
         if (block.timestamp > order.approvalDeadline) revert ApprovalExpired();
 
-        uint256 deliveryTimeout = sellerRegistry.getSellerDeliveryTimeout(order.seller);
+        uint256 deliveryTimeout = sellers[order.seller].deliveryTimeout;
         if (deliveryTimeout == 0) revert InvalidTimeout();
         uint256 deliveryDeadline = block.timestamp + deliveryTimeout;
 
@@ -189,10 +84,7 @@ contract OrderRegistry {
         emit SellerConfirmed(orderId);
     }
 
-    function commitDelivery(
-        uint256 orderId,
-        bytes32 deliveryHash
-    ) external {
+    function commitDelivery(uint256 orderId, bytes32 deliveryHash) external {
         Order storage order = orders[orderId];
         if (order.status != OrderStatus.Created) revert InvalidStatus();
         if (msg.sender != order.seller) revert Unauthorized();
@@ -236,7 +128,7 @@ contract OrderRegistry {
             if (msg.sender != order.buyer) revert Unauthorized();
         }
 
-        (, , , , uint256 responseTimeout) = validatorRegistry.getValidator(order.validator);
+        uint256 responseTimeout = validators[order.validator].responseTimeout;
         uint256 responseDeadline = block.timestamp + responseTimeout;
 
         order.responseDeadline = responseDeadline;

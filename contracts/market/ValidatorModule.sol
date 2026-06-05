@@ -1,33 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract ValidatorRegistry {
-    struct Validator {
-        bool registered;
-        bool active;
-        string validatorURI;
-        uint256 fee;
-        uint256 responseTimeout;
-    }
+import "./MarketStorage.sol";
 
-    error AlreadyRegistered();
-    error NotRegistered();
-    error InvalidResponseTimeout();
-
-    event ValidatorRegistered(
-        address indexed validator,
-        string validatorURI,
-        uint256 fee,
-        uint256 responseTimeout
-    );
-    event ValidatorURIUpdated(address indexed validator, string validatorURI);
-    event ValidatorActiveUpdated(address indexed validator, bool active);
-    event ValidatorFeeUpdated(address indexed validator, uint256 fee);
-    event ValidatorResponseTimeoutUpdated(address indexed validator, uint256 responseTimeout);
-
-    mapping(address => Validator) private validators;
-    address[] private validatorList;
-
+abstract contract ValidatorModule is MarketStorage {
     modifier onlyRegisteredValidator() {
         if (!validators[msg.sender].registered) revert NotRegistered();
         _;

@@ -4,7 +4,7 @@
 
 本文提出一个面向数字商品与数字服务交付的交易协议层。它参考 ERC-8004 的 agent 身份、发现、声誉与验证思想，让卖家声明自己支持的 validator，让买家根据自己信任的 validator 筛选卖家，并通过 escrow 合约完成资金托管、交付证据固定和争议裁决。
 
-当前 v1 合约采用独立 registry 实现，包含 `SellerRegistry`、`ValidatorRegistry` 和 `OrderRegistry`。ERC-8004 在本项目中作为长期集成方向：未来可以把卖家和 validator 的地址映射到 ERC-8004 agent 身份，并把交易反馈、裁决记录写入 Reputation Registry 或 Validation Registry。
+当前 v1 合约采用单一 `Market` 合约入口实现。`Market` 内部按模块组织 seller registry、validator registry 和 order escrow 逻辑，但部署和调用时只有一个市场地址。ERC-8004 在本项目中作为长期集成方向：未来可以把卖家和 validator 的地址映射到 ERC-8004 agent 身份，并把交易反馈、裁决记录写入 Reputation Registry 或 Validation Registry。
 
 协议的核心不是让智能合约自动判断交付质量，而是把交易过程中的关键事实结构化：卖家承诺卖什么、买家本次请求是什么、卖家实际交付了什么、validator 为什么作出某个裁决。链上保存 hash、状态和资金流，链下保存具体内容、证据和裁决报告。
 
@@ -24,7 +24,7 @@
 
 ### 卖家
 
-卖家通过 `SellerRegistry` 使用自己的钱包地址注册。当前 v1 中，卖家地址就是卖家主键。
+卖家通过 `Market` 的 seller 模块使用自己的钱包地址注册。当前 v1 中，卖家地址就是卖家主键。
 
 卖家注册时维护以下信息：
 
@@ -45,7 +45,7 @@
 
 ### Validator
 
-validator 通过 `ValidatorRegistry` 使用自己的钱包地址注册。当前 v1 中，validator 地址就是 validator 主键。
+validator 通过 `Market` 的 validator 模块使用自己的钱包地址注册。当前 v1 中，validator 地址就是 validator 主键。
 
 validator 维护以下信息：
 
@@ -54,11 +54,11 @@ validator 维护以下信息：
 - `responseTimeout`：争议开启后必须作出裁决的默认响应时限。
 - `active`：是否当前接受新订单。
 
-validator 不托管资金。资金始终在 `OrderRegistry` 中。validator 的权力仅限于争议状态下提交裁决。
+validator 不托管资金。资金始终在 `Market` 合约中。validator 的权力仅限于争议状态下提交裁决。
 
-### OrderRegistry
+### Market
 
-`OrderRegistry` 是当前 v1 的 escrow 合约，负责：
+`Market` 是当前 v1 的唯一链上入口。它内部包含 seller registry、validator registry 和 order escrow 三个逻辑模块，负责：
 
 - 创建订单并锁定 `price + validatorFee`。
 - 快照卖家的 `contentHash` 作为 `listingHash`。
@@ -87,15 +87,15 @@ sellerSupportedValidators ∩ buyerTrustedValidators != ∅
 
 ### 1. 卖家与 Validator 注册
 
-卖家先在 `SellerRegistry` 注册自己的资料、商品价格、商品说明 hash、默认交付时限，并添加自己愿意接受的 validator。
+卖家先在 `Market` 注册自己的资料、商品价格、商品说明 hash、默认交付时限，并添加自己愿意接受的 validator。
 
-validator 在 `ValidatorRegistry` 注册自己的资料、仲裁费用和响应时限。
+validator 在 `Market` 注册自己的资料、仲裁费用和响应时限。
 
-前端或 CLI 可以读取卖家列表、validator 列表和支持关系，帮助买家筛选合适卖家。
+前端或 CLI 只需要配置 `marketAddress`，然后从 `Market` 读取卖家列表、validator 列表和支持关系，帮助买家筛选合适卖家。
 
 ### 2. 买家创建订单并锁定资金
 
-买家选择 seller、validator，并为本次需求生成 `requestHash`。创建订单时，买家向 `OrderRegistry` 支付：
+买家选择 seller、validator，并为本次需求生成 `requestHash`。创建订单时，买家向 `Market` 支付：
 
 ```text
 seller.price + validator.fee
@@ -193,7 +193,7 @@ listingHash   -> requestHash   -> deliveryHash   -> resolutionHash
 
 ## 状态机
 
-当前 `OrderRegistry` 的状态如下：
+当前 `Market` 中订单模块的状态如下：
 
 ```text
 None
@@ -264,7 +264,7 @@ Created + deliveryDeadline expired -> Disputed
 
 ### 发现与筛选
 
-买家在 CLI 或前端中维护自己信任的 validator 集合。系统读取 `SellerRegistry` 中的卖家列表和每个卖家支持的 validator，只展示与买家信任集合存在交集的卖家。
+买家在 CLI 或前端中维护自己信任的 validator 集合。系统读取 `Market` 中的卖家列表和每个卖家支持的 validator，只展示与买家信任集合存在交集的卖家。
 
 买家还可以查看卖家的 `sellerURI`、商品价格、`contentURI`、`contentHash` 和默认交付时限。
 
@@ -306,4 +306,4 @@ validator 根据 `listingHash`、`requestHash`、`deliveryHash` 和链下证据�
 
 第一版不要求链上加密交付。加密、私密证据提交、多 validator 仲裁、validator 质押和 slashing 可以作为后续增强能力。
 
-第一版 registry 使用地址作为主键。未来可以把地址迁移或映射到 ERC-8004 agentId。
+第一版 `Market` 内部 registry 模块使用地址作为主键。未来可以把地址迁移或映射到 ERC-8004 agentId。
