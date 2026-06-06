@@ -11,6 +11,7 @@ import (
 	"agent-nexus-seller-service/internal/config"
 	"agent-nexus-seller-service/internal/httpapi"
 	"agent-nexus-seller-service/internal/store"
+	"agent-nexus-seller-service/internal/watcher"
 )
 
 func main() {
@@ -47,6 +48,9 @@ func serve(ctx context.Context) error {
 		Addr:    cfg.HTTPAddr,
 		Handler: httpapi.NewHandler(cfg, market, db),
 	}
+
+	orderWatcher := watcher.New(market, db, cfg.MarketAddress, cfg.SellerAddress, cfg.PollInterval)
+	go orderWatcher.Run(ctx)
 
 	log.Printf("seller service listening on %s", cfg.HTTPAddr)
 	return server.ListenAndServe()

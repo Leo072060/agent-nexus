@@ -12,20 +12,14 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-func DeliveryRequestMessage(marketAddress common.Address, orderID *big.Int) string {
+func DisputeEvidenceMessage(marketAddress common.Address, orderID *big.Int, requestHash string, deliveryHash string, disputeHash string) string {
 	return fmt.Sprintf(
-		"Agent Nexus delivery request\nmarketAddress: %s\norderId: %s",
-		marketAddress.Hex(),
-		orderID.String(),
-	)
-}
-
-func OrderRequestMessage(marketAddress common.Address, orderID *big.Int, requestHash string) string {
-	return fmt.Sprintf(
-		"Agent Nexus order request\nmarketAddress: %s\norderId: %s\nrequestHash: %s",
+		"Agent Nexus dispute evidence\nmarketAddress: %s\norderId: %s\nrequestHash: %s\ndeliveryHash: %s\ndisputeHash: %s",
 		marketAddress.Hex(),
 		orderID.String(),
 		strings.ToLower(requestHash),
+		strings.ToLower(deliveryHash),
+		strings.ToLower(disputeHash),
 	)
 }
 
@@ -64,8 +58,4 @@ func Keccak256(data []byte) [32]byte {
 	var out [32]byte
 	copy(out[:], sum)
 	return out
-}
-
-func EqualHash(hash [32]byte, hexHash string) bool {
-	return strings.EqualFold("0x"+common.Bytes2Hex(hash[:]), hexHash)
 }

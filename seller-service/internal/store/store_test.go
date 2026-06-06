@@ -36,3 +36,41 @@ func TestUpsertAndGetDelivery(t *testing.T) {
 		t.Fatalf("delivery body mismatch: %s", string(delivery.DeliveryBody))
 	}
 }
+
+func TestUpsertOrderRequestAndMarkSellerConfirmed(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seller-service.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	orderID := big.NewInt(12)
+	_, err = s.UpsertOrderRequest(
+		context.Background(),
+		orderID,
+		"0xbuyer",
+		"0xseller",
+		"0xvalidator",
+		"0xrequest",
+		[]byte("request body"),
+		"request_received",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkSellerConfirmed(context.Background(), orderID, "0xtx"); err != nil {
+		t.Fatal(err)
+	}
+
+	order, err := s.GetOrder(context.Background(), orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(order.RequestBody) != "request body" {
+		t.Fatalf("request body mismatch: %s", string(order.RequestBody))
+	}
+	if order.ConfirmSellerTxHash != "0xtx" {
+		t.Fatalf("confirm tx mismatch: %s", order.ConfirmSellerTxHash)
+	}
+}

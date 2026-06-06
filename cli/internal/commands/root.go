@@ -39,6 +39,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(NewMarketCommand(cfg))
 	cmd.AddCommand(NewRequestCommand(cfg))
 	cmd.AddCommand(NewFindSellersCommand(cfg))
+	cmd.AddCommand(NewOrdersCommand(cfg))
 
 	return cmd
 }

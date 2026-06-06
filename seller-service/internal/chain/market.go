@@ -12,10 +12,19 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
 const marketABIJSON = `[
+  {
+    "inputs": [],
+    "name": "getOrderCount",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
   {
     "inputs": [{"internalType": "uint256", "name": "orderId", "type": "uint256"}],
     "name": "getOrder",
@@ -65,6 +74,8 @@ const marketABIJSON = `[
 ]`
 
 const (
+	OrderStatusPendingSeller     uint8 = 1
+	OrderStatusCreated           uint8 = 3
 	OrderStatusDeliveryCommitted uint8 = 4
 )
 
@@ -127,12 +138,39 @@ func (m *MarketClient) GetOrder(ctx context.Context, orderID *big.Int) (Order, e
 	return decodeOrder(outputs[0])
 }
 
-func (m *MarketClient) PackConfirmAsSeller(orderID *big.Int) ([]byte, error) {
-	return m.abi.Pack("confirmAsSeller", orderID)
+func (m *MarketClient) GetOrderCount(ctx context.Context) (*big.Int, error) {
+	outputs, err := m.call(ctx, "getOrderCount")
+	if err != nil {
+		return nil, err
+	}
+	if len(outputs) != 1 {
+		return nil, fmt.Errorf("decode getOrderCount output")
+	}
+
+	count, ok := outputs[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("getOrderCount returned %T, expected *big.Int", outputs[0])
+	}
+
+	return count, nil
 }
 
-func (m *MarketClient) PackCommitDelivery(orderID *big.Int, deliveryHash [32]byte) ([]byte, error) {
-	return m.abi.Pack("commitDelivery", orderID, deliveryHash)
+func (m *MarketClient) ConfirmAsSeller(ctx context.Context, orderID *big.Int) (string, error) {
+	input, err := m.abi.Pack("confirmAsSeller", orderID)
+	if err != nil {
+		return "", fmt.Errorf("pack confirmAsSeller: %w", err)
+	}
+
+	return m.sendTransaction(ctx, input)
+}
+
+func (m *MarketClient) CommitDelivery(ctx context.Context, orderID *big.Int, deliveryHash [32]byte) (string, error) {
+	input, err := m.abi.Pack("commitDelivery", orderID, deliveryHash)
+	if err != nil {
+		return "", fmt.Errorf("pack commitDelivery: %w", err)
+	}
+
+	return m.sendTransaction(ctx, input)
 }
 
 func (m *MarketClient) call(ctx context.Context, method string, args ...any) ([]any, error) {
@@ -158,6 +196,41 @@ func (m *MarketClient) call(ctx context.Context, method string, args ...any) ([]
 	}
 
 	return outputs, nil
+}
+
+func (m *MarketClient) sendTransaction(ctx context.Context, input []byte) (string, error) {
+	from := gethcrypto.PubkeyToAddress(m.privateKey.PublicKey)
+	chainID, err := m.client.ChainID(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read chain id: %w", err)
+	}
+	nonce, err := m.client.PendingNonceAt(ctx, from)
+	if err != nil {
+		return "", fmt.Errorf("read nonce: %w", err)
+	}
+	gasPrice, err := m.client.SuggestGasPrice(ctx)
+	if err != nil {
+		return "", fmt.Errorf("suggest gas price: %w", err)
+	}
+	gasLimit, err := m.client.EstimateGas(ctx, ethereum.CallMsg{
+		From: from,
+		To:   &m.marketAddress,
+		Data: input,
+	})
+	if err != nil {
+		return "", fmt.Errorf("estimate gas: %w", err)
+	}
+
+	tx := types.NewTransaction(nonce, m.marketAddress, big.NewInt(0), gasLimit, gasPrice, input)
+	signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), m.privateKey)
+	if err != nil {
+		return "", fmt.Errorf("sign transaction: %w", err)
+	}
+	if err := m.client.SendTransaction(ctx, signedTx); err != nil {
+		return "", fmt.Errorf("send transaction: %w", err)
+	}
+
+	return signedTx.Hash().Hex(), nil
 }
 
 func decodeOrder(value any) (Order, error) {

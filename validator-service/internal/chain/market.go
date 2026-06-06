@@ -19,32 +19,6 @@ import (
 
 const marketABIJSON = `[
   {
-    "inputs": [],
-    "name": "getSellers",
-    "outputs": [
-      {"internalType": "address[]", "name": "", "type": "address[]"}
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {"internalType": "address", "name": "seller", "type": "address"}
-    ],
-    "name": "getSeller",
-    "outputs": [
-      {"internalType": "bool", "name": "registered", "type": "bool"},
-      {"internalType": "bool", "name": "active", "type": "bool"},
-      {"internalType": "string", "name": "sellerURI", "type": "string"},
-      {"internalType": "uint256", "name": "price", "type": "uint256"},
-      {"internalType": "string", "name": "contentURI", "type": "string"},
-      {"internalType": "bytes32", "name": "contentHash", "type": "bytes32"},
-      {"internalType": "uint256", "name": "deliveryTimeout", "type": "uint256"}
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
     "inputs": [{"internalType": "uint256", "name": "orderId", "type": "uint256"}],
     "name": "getOrder",
     "outputs": [
@@ -74,15 +48,18 @@ const marketABIJSON = `[
     "type": "function"
   },
   {
-    "inputs": [{"internalType": "uint256", "name": "orderId", "type": "uint256"}],
-    "name": "openDispute",
+    "inputs": [
+      {"internalType": "uint256", "name": "orderId", "type": "uint256"},
+      {"internalType": "bool", "name": "releaseToSeller", "type": "bool"},
+      {"internalType": "bytes32", "name": "resolutionHash", "type": "bytes32"}
+    ],
+    "name": "resolveDispute",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
   }
 ]`
 
-const OrderStatusDeliveryCommitted uint8 = 4
 const OrderStatusDisputed uint8 = 5
 
 type MarketClient struct {
@@ -92,39 +69,16 @@ type MarketClient struct {
 	privateKey    *ecdsa.PrivateKey
 }
 
-type Seller struct {
-	Address         common.Address
-	Registered      bool
-	Active          bool
-	SellerURI       string
-	Price           *big.Int
-	ContentURI      string
-	ContentHash     string
-	DeliveryTimeout *big.Int
-}
-
 type Order struct {
 	Buyer        common.Address
 	Seller       common.Address
 	Validator    common.Address
-	DeliveryHash string
 	RequestHash  string
+	DeliveryHash string
 	Status       uint8
 }
 
-func (m *MarketClient) Address() common.Address {
-	return m.marketAddress
-}
-
-func NewMarketClient(ctx context.Context, rpcURL string, marketAddress string) (*MarketClient, error) {
-	return NewMarketClientWithPrivateKey(ctx, rpcURL, marketAddress, nil)
-}
-
-func NewMarketClientWithPrivateKey(ctx context.Context, rpcURL string, marketAddress string, privateKey *ecdsa.PrivateKey) (*MarketClient, error) {
-	if !common.IsHexAddress(marketAddress) {
-		return nil, fmt.Errorf("invalid market address")
-	}
-
+func NewMarketClient(ctx context.Context, rpcURL string, marketAddress common.Address, privateKey *ecdsa.PrivateKey) (*MarketClient, error) {
 	parsedABI, err := abi.JSON(strings.NewReader(marketABIJSON))
 	if err != nil {
 		return nil, fmt.Errorf("parse market ABI: %w", err)
@@ -137,7 +91,7 @@ func NewMarketClientWithPrivateKey(ctx context.Context, rpcURL string, marketAdd
 
 	return &MarketClient{
 		client:        client,
-		marketAddress: common.HexToAddress(marketAddress),
+		marketAddress: marketAddress,
 		abi:           parsedABI,
 		privateKey:    privateKey,
 	}, nil
@@ -147,47 +101,23 @@ func (m *MarketClient) Close() {
 	m.client.Close()
 }
 
-func (m *MarketClient) GetSellers(ctx context.Context) ([]common.Address, error) {
-	outputs, err := m.call(ctx, "getSellers")
-	if err != nil {
-		return nil, err
-	}
-
-	sellers, ok := outputs[0].([]common.Address)
-	if !ok {
-		return nil, fmt.Errorf("decode getSellers output")
-	}
-
-	return sellers, nil
-}
-
-func (m *MarketClient) GetSeller(ctx context.Context, seller common.Address) (Seller, error) {
-	outputs, err := m.call(ctx, "getSeller", seller)
-	if err != nil {
-		return Seller{}, err
-	}
-
-	contentHash, ok := outputs[5].([32]byte)
-	if !ok {
-		return Seller{}, fmt.Errorf("decode contentHash")
-	}
-
-	return Seller{
-		Address:         seller,
-		Registered:      outputs[0].(bool),
-		Active:          outputs[1].(bool),
-		SellerURI:       outputs[2].(string),
-		Price:           outputs[3].(*big.Int),
-		ContentURI:      outputs[4].(string),
-		ContentHash:     "0x" + hex.EncodeToString(contentHash[:]),
-		DeliveryTimeout: outputs[6].(*big.Int),
-	}, nil
-}
-
 func (m *MarketClient) GetOrder(ctx context.Context, orderID *big.Int) (Order, error) {
-	outputs, err := m.call(ctx, "getOrder", orderID)
+	input, err := m.abi.Pack("getOrder", orderID)
 	if err != nil {
-		return Order{}, err
+		return Order{}, fmt.Errorf("pack getOrder: %w", err)
+	}
+
+	result, err := m.client.CallContract(ctx, ethereum.CallMsg{
+		To:   &m.marketAddress,
+		Data: input,
+	}, nil)
+	if err != nil {
+		return Order{}, fmt.Errorf("call getOrder: %w", err)
+	}
+
+	outputs, err := m.abi.Unpack("getOrder", result)
+	if err != nil {
+		return Order{}, fmt.Errorf("unpack getOrder: %w", err)
 	}
 	if len(outputs) != 1 {
 		return Order{}, fmt.Errorf("decode getOrder output")
@@ -208,38 +138,13 @@ func (m *MarketClient) GetOrder(ctx context.Context, orderID *big.Int) (Order, e
 	}, nil
 }
 
-func (m *MarketClient) OpenDispute(ctx context.Context, orderID *big.Int) (string, error) {
-	input, err := m.abi.Pack("openDispute", orderID)
+func (m *MarketClient) ResolveDispute(ctx context.Context, orderID *big.Int, releaseToSeller bool, resolutionHash [32]byte) (string, error) {
+	input, err := m.abi.Pack("resolveDispute", orderID, releaseToSeller, resolutionHash)
 	if err != nil {
-		return "", fmt.Errorf("pack openDispute: %w", err)
+		return "", fmt.Errorf("pack resolveDispute: %w", err)
 	}
 
 	return m.sendTransaction(ctx, input)
-}
-
-func (m *MarketClient) call(ctx context.Context, method string, args ...any) ([]any, error) {
-	input, err := m.abi.Pack(method, args...)
-	if err != nil {
-		return nil, fmt.Errorf("pack %s: %w", method, err)
-	}
-
-	result, err := m.client.CallContract(ctx, ethereum.CallMsg{
-		To:   &m.marketAddress,
-		Data: input,
-	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("call %s: %w", method, err)
-	}
-	if len(result) == 0 {
-		return nil, fmt.Errorf("call %s: empty response from market contract", method)
-	}
-
-	outputs, err := m.abi.Unpack(method, result)
-	if err != nil {
-		return nil, fmt.Errorf("unpack %s: %w", method, err)
-	}
-
-	return outputs, nil
 }
 
 func (m *MarketClient) sendTransaction(ctx context.Context, input []byte) (string, error) {

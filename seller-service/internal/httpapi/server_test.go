@@ -22,12 +22,20 @@ import (
 )
 
 type fakeMarket struct {
-	order chain.Order
-	err   error
+	order         chain.Order
+	err           error
+	confirmTxHash string
 }
 
 func (f fakeMarket) GetOrder(context.Context, *big.Int) (chain.Order, error) {
 	return f.order, f.err
+}
+
+func (f fakeMarket) ConfirmAsSeller(context.Context, *big.Int) (string, error) {
+	if f.confirmTxHash != "" {
+		return f.confirmTxHash, nil
+	}
+	return "0xconfirm", nil
 }
 
 func TestHealth(t *testing.T) {
@@ -55,6 +63,74 @@ func TestDeliveryMarketMismatch(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status mismatch: %d", response.Code)
+	}
+}
+
+func TestOrderRequestSuccess(t *testing.T) {
+	buyerKey := mustKey(t)
+	sellerKey := mustKey(t)
+	buyer := gethcrypto.PubkeyToAddress(buyerKey.PublicKey)
+	seller := gethcrypto.PubkeyToAddress(sellerKey.PublicKey)
+	validator := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	market := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	orderID := big.NewInt(12)
+	requestBody := "please review this contract"
+	requestHash := agentcrypto.Keccak256Hex([]byte(requestBody))
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "seller-service.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	signature := signOrderRequest(t, buyerKey, market, orderID, requestHash)
+	handler := NewHandler(
+		config.Config{
+			MarketAddress: market,
+			SellerAddress: seller,
+		},
+		fakeMarket{
+			order: chain.Order{
+				Buyer:       buyer,
+				Seller:      seller,
+				Validator:   validator,
+				RequestHash: requestHash,
+				Status:      chain.OrderStatusPendingSeller,
+			},
+			confirmTxHash: "0xabc",
+		},
+		db,
+	)
+
+	payload := map[string]string{
+		"marketAddress": market.Hex(),
+		"orderId":       orderID.String(),
+		"request":       requestBody,
+		"signature":     signature,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/agent-nexus/orders/request", strings.NewReader(string(payloadBytes)))
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status mismatch: %d body=%s", response.Code, response.Body.String())
+	}
+
+	order, err := db.GetOrder(context.Background(), orderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order.RequestHash != requestHash {
+		t.Fatalf("request hash mismatch: %s", order.RequestHash)
+	}
+	if order.ConfirmSellerTxHash != "0xabc" {
+		t.Fatalf("confirm tx mismatch: %s", order.ConfirmSellerTxHash)
 	}
 }
 
@@ -170,6 +246,19 @@ func mustKey(t *testing.T) *ecdsa.PrivateKey {
 func signDeliveryRequest(t *testing.T, key *ecdsa.PrivateKey, market common.Address, orderID *big.Int) string {
 	t.Helper()
 	message := agentcrypto.DeliveryRequestMessage(market, orderID)
+	prefix := "\x19Ethereum Signed Message:\n" + strconv.Itoa(len(message))
+	hash := gethcrypto.Keccak256Hash([]byte(prefix + message))
+	signature, err := gethcrypto.Sign(hash.Bytes(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature[64] += 27
+	return "0x" + common.Bytes2Hex(signature)
+}
+
+func signOrderRequest(t *testing.T, key *ecdsa.PrivateKey, market common.Address, orderID *big.Int, requestHash string) string {
+	t.Helper()
+	message := agentcrypto.OrderRequestMessage(market, orderID, requestHash)
 	prefix := "\x19Ethereum Signed Message:\n" + strconv.Itoa(len(message))
 	hash := gethcrypto.Keccak256Hash([]byte(prefix + message))
 	signature, err := gethcrypto.Sign(hash.Bytes(), key)

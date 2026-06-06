@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"math/big"
-	"strconv"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -17,39 +16,32 @@ func TestDeliveryRequestMessage(t *testing.T) {
 	}
 }
 
-func TestOrderRequestMessage(t *testing.T) {
-	message := OrderRequestMessage(
+func TestDisputeEvidenceMessage(t *testing.T) {
+	message := DisputeEvidenceMessage(
 		common.HexToAddress("0x1234567890123456789012345678901234567890"),
 		big.NewInt(12),
-		"0xABC",
+		"0xAAA",
+		"0xBBB",
+		"0xCCC",
 	)
-	expected := "Agent Nexus order request\nmarketAddress: 0x1234567890123456789012345678901234567890\norderId: 12\nrequestHash: 0xabc"
+	expected := "Agent Nexus dispute evidence\nmarketAddress: 0x1234567890123456789012345678901234567890\norderId: 12\nrequestHash: 0xaaa\ndeliveryHash: 0xbbb\ndisputeHash: 0xccc"
 	if message != expected {
 		t.Fatalf("message mismatch\nexpected: %q\nactual:   %q", expected, message)
 	}
 }
 
-func TestRecoverSigner(t *testing.T) {
+func TestSignPersonalMessage(t *testing.T) {
 	privateKey, err := gethcrypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := gethcrypto.PubkeyToAddress(privateKey.PublicKey)
-	message := DeliveryRequestMessage(common.HexToAddress("0x1234567890123456789012345678901234567890"), big.NewInt(12))
-	hash := gethcrypto.Keccak256Hash([]byte("\x19Ethereum Signed Message:\n" + strconv.Itoa(len(message)) + message))
 
-	signature, err := gethcrypto.Sign(hash.Bytes(), privateKey)
+	signature, err := SignPersonalMessage(privateKey, "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
-	signature[64] += 27
-
-	got, err := RecoverSigner(message, "0x"+common.Bytes2Hex(signature))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("signer mismatch: want %s got %s", want.Hex(), got.Hex())
+	if len(common.FromHex(signature)) != 65 {
+		t.Fatalf("signature length mismatch: %d", len(common.FromHex(signature)))
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/big"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -30,6 +32,24 @@ type Market struct {
 	Active        bool   `json:"active"`
 	CreatedAt     string `json:"createdAt"`
 	UpdatedAt     string `json:"updatedAt"`
+}
+
+type Order struct {
+	ID                int64    `json:"id"`
+	RPCURL            string   `json:"rpcUrl"`
+	MarketAddress     string   `json:"marketAddress"`
+	ChainOrderID      *big.Int `json:"chainOrderId"`
+	BuyerAddress      string   `json:"buyerAddress,omitempty"`
+	SellerURI         string   `json:"sellerUri"`
+	ValidatorURI      string   `json:"validatorUri,omitempty"`
+	RequestContent    string   `json:"requestContent,omitempty"`
+	DeliveryHash      string   `json:"deliveryHash,omitempty"`
+	Delivery          string   `json:"delivery,omitempty"`
+	Dispute           string   `json:"dispute,omitempty"`
+	OpenDisputeTxHash string   `json:"openDisputeTxHash,omitempty"`
+	Status            string   `json:"status"`
+	CreatedAt         string   `json:"createdAt"`
+	UpdatedAt         string   `json:"updatedAt"`
 }
 
 type CreateRequestInput struct {
@@ -86,9 +106,150 @@ CREATE TABLE IF NOT EXISTS markets (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS orders (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	rpc_url TEXT NOT NULL,
+	market_address TEXT NOT NULL,
+	chain_order_id TEXT NOT NULL,
+	buyer_address TEXT NOT NULL DEFAULT '',
+	seller_uri TEXT NOT NULL,
+	validator_uri TEXT NOT NULL DEFAULT '',
+	request_content TEXT NOT NULL DEFAULT '',
+	delivery_hash TEXT,
+	delivery TEXT,
+	dispute TEXT NOT NULL DEFAULT '',
+	open_dispute_tx_hash TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
 `)
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+
+	for _, stmt := range []string{
+		`ALTER TABLE orders ADD COLUMN buyer_address TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN validator_uri TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN request_content TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN dispute TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN open_dispute_tx_hash TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migrate database: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) GetOrder(ctx context.Context, id int64) (Order, error) {
+	var order Order
+	var chainOrderID string
+
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT
+	id,
+	rpc_url,
+	market_address,
+	chain_order_id,
+	COALESCE(buyer_address, ''),
+	seller_uri,
+	COALESCE(validator_uri, ''),
+	COALESCE(request_content, ''),
+	COALESCE(delivery_hash, ''),
+	COALESCE(delivery, ''),
+	COALESCE(dispute, ''),
+	COALESCE(open_dispute_tx_hash, ''),
+	status,
+	created_at,
+	updated_at
+FROM orders WHERE id = ?`,
+		id,
+	).Scan(
+		&order.ID,
+		&order.RPCURL,
+		&order.MarketAddress,
+		&chainOrderID,
+		&order.BuyerAddress,
+		&order.SellerURI,
+		&order.ValidatorURI,
+		&order.RequestContent,
+		&order.DeliveryHash,
+		&order.Delivery,
+		&order.Dispute,
+		&order.OpenDisputeTxHash,
+		&order.Status,
+		&order.CreatedAt,
+		&order.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Order{}, fmt.Errorf("order not found: %d", id)
+	}
+	if err != nil {
+		return Order{}, fmt.Errorf("get order: %w", err)
+	}
+
+	parsedOrderID, ok := new(big.Int).SetString(chainOrderID, 10)
+	if !ok {
+		return Order{}, fmt.Errorf("invalid chain_order_id for order %d", id)
+	}
+	order.ChainOrderID = parsedOrderID
+
+	return order, nil
+}
+
+func (s *Store) UpdateOrderDelivery(ctx context.Context, id int64, deliveryHash string, delivery string, status string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE orders SET delivery_hash = ?, delivery = ?, status = ?, updated_at = ? WHERE id = ?`,
+		deliveryHash,
+		delivery,
+		status,
+		now,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update order delivery: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check updated order: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("order not found: %d", id)
+	}
+
+	return nil
+}
+
+func (s *Store) UpdateOrderDispute(ctx context.Context, id int64, requestContent string, delivery string, dispute string, txHash string, status string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE orders SET request_content = ?, delivery = ?, dispute = ?, open_dispute_tx_hash = ?, status = ?, updated_at = ? WHERE id = ?`,
+		requestContent,
+		delivery,
+		dispute,
+		txHash,
+		status,
+		now,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update order dispute: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check updated order: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("order not found: %d", id)
 	}
 
 	return nil
