@@ -1,0 +1,8 @@
+go 1.26.1
+
+use (
+	./cli
+	./integration
+	./seller-service
+	./validator-service
+)
