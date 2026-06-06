@@ -4,3 +4,9 @@
 # Editor / OS junk
 *.swp
 Thumbs.db
+
+# Local runtime / demo data (sqlite DBs, anvil logs)
+*.db
+*.db-shm
+*.db-wal
+scripts/*.log

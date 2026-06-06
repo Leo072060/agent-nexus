@@ -16,6 +16,15 @@ type Store struct {
 	db *sql.DB
 }
 
+// ErrDisputeNotFound is returned by GetDispute when no row matches the order id.
+var ErrDisputeNotFound = errors.New("dispute not found")
+
+const disputeColumns = `id, chain_order_id, buyer_address, seller_address, validator_address, request_hash, request_body, delivery_hash, delivery_body, dispute_hash, dispute_body, resolution_hash, resolution_body, release_to_seller, resolve_tx_hash, status, created_at, updated_at`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 type Dispute struct {
 	ID               int64
 	ChainOrderID     *big.Int
@@ -197,14 +206,57 @@ func (s *Store) MarkResolved(
 }
 
 func (s *Store) GetDispute(ctx context.Context, chainOrderID *big.Int) (Dispute, error) {
-	var dispute Dispute
-	var chainOrderIDText string
-	var releaseToSeller int
-	err := s.db.QueryRowContext(
+	row := s.db.QueryRowContext(
 		ctx,
-		`SELECT id, chain_order_id, buyer_address, seller_address, validator_address, request_hash, request_body, delivery_hash, delivery_body, dispute_hash, dispute_body, resolution_hash, resolution_body, release_to_seller, resolve_tx_hash, status, created_at, updated_at FROM disputes WHERE chain_order_id = ?`,
+		`SELECT `+disputeColumns+` FROM disputes WHERE chain_order_id = ?`,
 		chainOrderID.String(),
-	).Scan(
+	)
+
+	dispute, err := scanDispute(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Dispute{}, fmt.Errorf("%w: %s", ErrDisputeNotFound, chainOrderID.String())
+	}
+	if err != nil {
+		return Dispute{}, fmt.Errorf("get dispute: %w", err)
+	}
+
+	return dispute, nil
+}
+
+// ListDisputes returns every stored dispute ordered by numeric order id ascending.
+func (s *Store) ListDisputes(ctx context.Context) ([]Dispute, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT `+disputeColumns+` FROM disputes ORDER BY CAST(chain_order_id AS INTEGER) ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list disputes: %w", err)
+	}
+	defer rows.Close()
+
+	disputes := make([]Dispute, 0)
+	for rows.Next() {
+		dispute, err := scanDispute(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list disputes: %w", err)
+		}
+		disputes = append(disputes, dispute)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list disputes: %w", err)
+	}
+
+	return disputes, nil
+}
+
+func scanDispute(scanner rowScanner) (Dispute, error) {
+	var (
+		dispute          Dispute
+		chainOrderIDText string
+		releaseToSeller  int
+	)
+
+	if err := scanner.Scan(
 		&dispute.ID,
 		&chainOrderIDText,
 		&dispute.BuyerAddress,
@@ -223,12 +275,8 @@ func (s *Store) GetDispute(ctx context.Context, chainOrderID *big.Int) (Dispute,
 		&dispute.Status,
 		&dispute.CreatedAt,
 		&dispute.UpdatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Dispute{}, fmt.Errorf("dispute not found: %s", chainOrderID.String())
-	}
-	if err != nil {
-		return Dispute{}, fmt.Errorf("get dispute: %w", err)
+	); err != nil {
+		return Dispute{}, err
 	}
 
 	parsedID, ok := new(big.Int).SetString(chainOrderIDText, 10)

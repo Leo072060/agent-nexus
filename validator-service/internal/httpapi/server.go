@@ -38,6 +38,8 @@ type DecisionMaker interface {
 type DisputeStore interface {
 	UpsertDispute(ctx context.Context, dispute store.Dispute) (store.Dispute, error)
 	MarkResolved(ctx context.Context, chainOrderID *big.Int, resolutionHash string, resolutionBody []byte, releaseToSeller bool, txHash string, status string) error
+	ListDisputes(ctx context.Context) ([]store.Dispute, error)
+	GetDispute(ctx context.Context, chainOrderID *big.Int) (store.Dispute, error)
 }
 
 type Handler struct {
@@ -62,6 +64,45 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type meResponse struct {
+	ValidatorAddress string `json:"validatorAddress"`
+	MarketAddress    string `json:"marketAddress"`
+	BaseURL          string `json:"baseURL"`
+}
+
+// disputeSummary is the public-shaped view of a stored dispute used in list responses.
+// Evidence bodies are intentionally omitted; they are only returned in the detail view.
+type disputeSummary struct {
+	OrderID          string `json:"orderId"`
+	BuyerAddress     string `json:"buyerAddress"`
+	SellerAddress    string `json:"sellerAddress"`
+	ValidatorAddress string `json:"validatorAddress"`
+	Status           string `json:"status"`
+	ReleaseToSeller  bool   `json:"releaseToSeller"`
+	ResolutionHash   string `json:"resolutionHash"`
+	ResolveTxHash    string `json:"resolveTxHash"`
+	CreatedAt        string `json:"createdAt"`
+	UpdatedAt        string `json:"updatedAt"`
+}
+
+// disputeDetail extends the summary with the plaintext evidence bodies and the parsed
+// LLM decision. The store keeps bodies as []byte (base64 under encoding/json), so they
+// are converted to strings here and ResolutionBody is decoded into a nested object.
+type disputeDetail struct {
+	disputeSummary
+	RequestHash  string        `json:"requestHash"`
+	Request      string        `json:"request"`
+	DeliveryHash string        `json:"deliveryHash"`
+	Delivery     string        `json:"delivery"`
+	DisputeHash  string        `json:"disputeHash"`
+	Dispute      string        `json:"dispute"`
+	Decision     *llm.Decision `json:"decision"`
+}
+
+type listDisputesResponse struct {
+	Disputes []disputeSummary `json:"disputes"`
+}
+
 func NewHandler(cfg config.Config, market MarketClient, store DisputeStore, decision DecisionMaker) http.Handler {
 	handler := &Handler{
 		cfg:      cfg,
@@ -72,9 +113,12 @@ func NewHandler(cfg config.Config, market MarketClient, store DisputeStore, deci
 	}
 
 	handler.mux.HandleFunc("GET /health", handler.handleHealth)
+	handler.mux.HandleFunc("GET /agent-nexus/me", handler.handleMe)
+	handler.mux.HandleFunc("GET /agent-nexus/disputes", handler.handleListDisputes)
+	handler.mux.HandleFunc("GET /agent-nexus/disputes/{orderId}", handler.handleGetDispute)
 	handler.mux.HandleFunc("POST /agent-nexus/disputes", handler.handleDispute)
 
-	return handler
+	return withCORS(handler)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -83,6 +127,53 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleMe reports which validator this service speaks for, so a dashboard can tell
+// whether a given order's validator is "me".
+func (h *Handler) handleMe(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, meResponse{
+		ValidatorAddress: h.cfg.ValidatorAddress.Hex(),
+		MarketAddress:    h.cfg.MarketAddress.Hex(),
+		BaseURL:          h.cfg.ValidatorBaseURL,
+	})
+}
+
+// handleListDisputes returns the summaries of every dispute this validator processed.
+func (h *Handler) handleListDisputes(w http.ResponseWriter, r *http.Request) {
+	disputes, err := h.store.ListDisputes(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	summaries := make([]disputeSummary, 0, len(disputes))
+	for _, dispute := range disputes {
+		summaries = append(summaries, toDisputeSummary(dispute))
+	}
+
+	writeJSON(w, http.StatusOK, listDisputesResponse{Disputes: summaries})
+}
+
+// handleGetDispute returns the full decision process (evidence + LLM ruling) for one order.
+func (h *Handler) handleGetDispute(w http.ResponseWriter, r *http.Request) {
+	orderID, err := parseOrderID(r.PathValue("orderId"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	dispute, err := h.store.GetDispute(r.Context(), orderID)
+	if errors.Is(err, store.ErrDisputeNotFound) {
+		writeJSONError(w, http.StatusNotFound, "dispute not found")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toDisputeDetail(dispute))
 }
 
 func (h *Handler) handleDispute(w http.ResponseWriter, r *http.Request) {
@@ -238,4 +329,61 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func toDisputeSummary(dispute store.Dispute) disputeSummary {
+	orderID := ""
+	if dispute.ChainOrderID != nil {
+		orderID = dispute.ChainOrderID.String()
+	}
+
+	return disputeSummary{
+		OrderID:          orderID,
+		BuyerAddress:     dispute.BuyerAddress,
+		SellerAddress:    dispute.SellerAddress,
+		ValidatorAddress: dispute.ValidatorAddress,
+		Status:           dispute.Status,
+		ReleaseToSeller:  dispute.ReleaseToSeller,
+		ResolutionHash:   dispute.ResolutionHash,
+		ResolveTxHash:    dispute.ResolveTxHash,
+		CreatedAt:        dispute.CreatedAt,
+		UpdatedAt:        dispute.UpdatedAt,
+	}
+}
+
+func toDisputeDetail(dispute store.Dispute) disputeDetail {
+	detail := disputeDetail{
+		disputeSummary: toDisputeSummary(dispute),
+		RequestHash:    dispute.RequestHash,
+		Request:        string(dispute.RequestBody),
+		DeliveryHash:   dispute.DeliveryHash,
+		Delivery:       string(dispute.DeliveryBody),
+		DisputeHash:    dispute.DisputeHash,
+		Dispute:        string(dispute.DisputeBody),
+	}
+
+	if len(dispute.ResolutionBody) > 0 {
+		var decision llm.Decision
+		if err := json.Unmarshal(dispute.ResolutionBody, &decision); err == nil {
+			detail.Decision = &decision
+		}
+	}
+
+	return detail
+}
+
+// withCORS allows the read-only dashboard (a separate origin, e.g. the Vite dev server)
+// to call these endpoints from a browser. Permissive origin is acceptable because every
+// route is read-only and unauthenticated; OPTIONS preflight is short-circuited here.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
