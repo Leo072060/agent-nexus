@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/twh/Projects/Agent Nexus/.codex/hooks/guard-bash.sh'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/twh/Projects/Agent Nexus/.codex/hooks/notify/notify.sh' stop"
+          }
+        ]
+      }
+    ]
+  }
+}
