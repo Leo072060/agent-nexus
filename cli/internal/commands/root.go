@@ -36,7 +36,9 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&cfg.DBPath, "db", "", "SQLite database path")
 
 	cmd.AddCommand(NewHashCommand())
+	cmd.AddCommand(NewMarketCommand(cfg))
 	cmd.AddCommand(NewRequestCommand(cfg))
+	cmd.AddCommand(NewFindSellersCommand(cfg))
 
 	return cmd
 }
