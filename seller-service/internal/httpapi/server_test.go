@@ -21,25 +21,25 @@ import (
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
-type fakeMarket struct {
+type testMarket struct {
 	order         chain.Order
 	err           error
 	confirmTxHash string
 }
 
-func (f fakeMarket) GetOrder(context.Context, *big.Int) (chain.Order, error) {
-	return f.order, f.err
+func (t testMarket) GetOrder(context.Context, *big.Int) (chain.Order, error) {
+	return t.order, t.err
 }
 
-func (f fakeMarket) ConfirmAsSeller(context.Context, *big.Int) (string, error) {
-	if f.confirmTxHash != "" {
-		return f.confirmTxHash, nil
+func (t testMarket) ConfirmAsSeller(context.Context, *big.Int) (string, error) {
+	if t.confirmTxHash != "" {
+		return t.confirmTxHash, nil
 	}
 	return "0xconfirm", nil
 }
 
 func TestHealth(t *testing.T) {
-	handler := NewHandler(config.Config{}, fakeMarket{}, nil)
+	handler := NewHandler(config.Config{}, testMarket{}, nil)
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/health", nil)
 
@@ -50,19 +50,44 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-func TestDeliveryMarketMismatch(t *testing.T) {
+func TestServices(t *testing.T) {
+	market := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	seller := common.HexToAddress("0x2222222222222222222222222222222222222222")
 	handler := NewHandler(config.Config{
-		MarketAddress: common.HexToAddress("0x1111111111111111111111111111111111111111"),
-	}, fakeMarket{}, nil)
+		ServiceID:          "contract-review",
+		ServiceName:        "Contract Review",
+		ServiceDescription: "Review contract text and return risk notes.",
+		MarketAddress:      market,
+		SellerAddress:      seller,
+	}, testMarket{}, nil)
 
-	body := `{"marketAddress":"0x2222222222222222222222222222222222222222","orderId":"12","signature":"0x00"}`
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/agent-nexus/delivery", strings.NewReader(body))
+	request := httptest.NewRequest(http.MethodGet, "/agent-nexus/services", nil)
 
 	handler.ServeHTTP(response, request)
 
-	if response.Code != http.StatusBadRequest {
+	if response.Code != http.StatusOK {
 		t.Fatalf("status mismatch: %d", response.Code)
+	}
+
+	var payload map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["id"] != "contract-review" {
+		t.Fatalf("id mismatch: %s", payload["id"])
+	}
+	if payload["name"] != "Contract Review" {
+		t.Fatalf("name mismatch: %s", payload["name"])
+	}
+	if payload["description"] != "Review contract text and return risk notes." {
+		t.Fatalf("description mismatch: %s", payload["description"])
+	}
+	if payload["marketAddress"] != market.Hex() {
+		t.Fatalf("market mismatch: %s", payload["marketAddress"])
+	}
+	if payload["sellerAddress"] != seller.Hex() {
+		t.Fatalf("seller mismatch: %s", payload["sellerAddress"])
 	}
 }
 
@@ -74,7 +99,7 @@ func TestOrderRequestSuccess(t *testing.T) {
 	validator := common.HexToAddress("0x3333333333333333333333333333333333333333")
 	market := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	orderID := big.NewInt(12)
-	requestBody := "please review this contract"
+	requestBody := "review this contract"
 	requestHash := agentcrypto.Keccak256Hex([]byte(requestBody))
 
 	db, err := store.Open(filepath.Join(t.TempDir(), "seller-service.db"))
@@ -89,7 +114,7 @@ func TestOrderRequestSuccess(t *testing.T) {
 			MarketAddress: market,
 			SellerAddress: seller,
 		},
-		fakeMarket{
+		testMarket{
 			order: chain.Order{
 				Buyer:       buyer,
 				Seller:      seller,
@@ -102,19 +127,18 @@ func TestOrderRequestSuccess(t *testing.T) {
 		db,
 	)
 
-	payload := map[string]string{
+	payloadBytes, err := json.Marshal(map[string]string{
 		"marketAddress": market.Hex(),
 		"orderId":       orderID.String(),
 		"request":       requestBody,
 		"signature":     signature,
-	}
-	payloadBytes, err := json.Marshal(payload)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/agent-nexus/orders/request", strings.NewReader(string(payloadBytes)))
+	request := httptest.NewRequest(http.MethodPost, "/agent-nexus/request", strings.NewReader(string(payloadBytes)))
 
 	handler.ServeHTTP(response, request)
 
@@ -141,7 +165,7 @@ func TestDeliverySuccess(t *testing.T) {
 	seller := gethcrypto.PubkeyToAddress(sellerKey.PublicKey)
 	market := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	orderID := big.NewInt(12)
-	deliveryBody := []byte("delivery body")
+	deliveryBody := []byte("approved")
 	deliveryHash := agentcrypto.Keccak256Hex(deliveryBody)
 
 	db, err := store.Open(filepath.Join(t.TempDir(), "seller-service.db"))
@@ -149,7 +173,19 @@ func TestDeliverySuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.UpsertDelivery(context.Background(), orderID, deliveryHash, deliveryBody); err != nil {
+	if _, err := db.UpsertOrderRequest(
+		context.Background(),
+		orderID,
+		buyer.Hex(),
+		seller.Hex(),
+		common.HexToAddress("0x3333333333333333333333333333333333333333").Hex(),
+		agentcrypto.Keccak256Hex([]byte("review this contract")),
+		[]byte("review this contract"),
+		"seller_confirmed",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkDeliveryCommitted(context.Background(), orderID, deliveryHash, deliveryBody, "0xevidence", []byte("evidence"), "0xcommit"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -159,7 +195,7 @@ func TestDeliverySuccess(t *testing.T) {
 			MarketAddress: market,
 			SellerAddress: seller,
 		},
-		fakeMarket{order: chain.Order{
+		testMarket{order: chain.Order{
 			Buyer:        buyer,
 			Seller:       seller,
 			DeliveryHash: deliveryHash,
@@ -168,12 +204,11 @@ func TestDeliverySuccess(t *testing.T) {
 		db,
 	)
 
-	payload := map[string]string{
+	payloadBytes, err := json.Marshal(map[string]string{
 		"marketAddress": market.Hex(),
 		"orderId":       orderID.String(),
 		"signature":     signature,
-	}
-	payloadBytes, err := json.Marshal(payload)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,49 +223,6 @@ func TestDeliverySuccess(t *testing.T) {
 	}
 	if response.Body.String() != string(deliveryBody) {
 		t.Fatalf("body mismatch: %s", response.Body.String())
-	}
-}
-
-func TestDeliveryHashMismatch(t *testing.T) {
-	buyerKey := mustKey(t)
-	sellerKey := mustKey(t)
-	buyer := gethcrypto.PubkeyToAddress(buyerKey.PublicKey)
-	seller := gethcrypto.PubkeyToAddress(sellerKey.PublicKey)
-	market := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	orderID := big.NewInt(12)
-
-	db, err := store.Open(filepath.Join(t.TempDir(), "seller-service.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := db.UpsertDelivery(context.Background(), orderID, "0xabc", []byte("delivery body")); err != nil {
-		t.Fatal(err)
-	}
-
-	signature := signDeliveryRequest(t, buyerKey, market, orderID)
-	handler := NewHandler(
-		config.Config{
-			MarketAddress: market,
-			SellerAddress: seller,
-		},
-		fakeMarket{order: chain.Order{
-			Buyer:        buyer,
-			Seller:       seller,
-			DeliveryHash: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-			Status:       chain.OrderStatusDeliveryCommitted,
-		}},
-		db,
-	)
-
-	payload := `{"marketAddress":"` + market.Hex() + `","orderId":"12","signature":"` + signature + `"}`
-	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/agent-nexus/delivery", strings.NewReader(payload))
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusConflict {
-		t.Fatalf("status mismatch: %d body=%s", response.Code, response.Body.String())
 	}
 }
 

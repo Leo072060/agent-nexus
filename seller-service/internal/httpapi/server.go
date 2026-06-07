@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -42,7 +43,7 @@ type Store interface {
 		status string,
 	) (store.Order, error)
 	MarkSellerConfirmed(ctx context.Context, chainOrderID *big.Int, txHash string) error
-	GetDelivery(ctx context.Context, chainOrderID *big.Int) (store.Delivery, error)
+	GetOrder(ctx context.Context, chainOrderID *big.Int) (store.Order, error)
 }
 
 type Handler struct {
@@ -69,6 +70,14 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type serviceResponse struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	MarketAddress string `json:"marketAddress"`
+	SellerAddress string `json:"sellerAddress"`
+}
+
 func NewHandler(cfg config.Config, market MarketClient, store Store) http.Handler {
 	handler := &Handler{
 		cfg:    cfg,
@@ -78,7 +87,8 @@ func NewHandler(cfg config.Config, market MarketClient, store Store) http.Handle
 	}
 
 	handler.mux.HandleFunc("GET /health", handler.handleHealth)
-	handler.mux.HandleFunc("POST /agent-nexus/orders/request", handler.handleOrderRequest)
+	handler.mux.HandleFunc("GET /agent-nexus/services", handler.handleServices)
+	handler.mux.HandleFunc("POST /agent-nexus/request", handler.handleOrderRequest)
 	handler.mux.HandleFunc("POST /agent-nexus/delivery", handler.handleDelivery)
 
 	return handler
@@ -92,6 +102,17 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (h *Handler) handleServices(w http.ResponseWriter, _ *http.Request) {
+	log.Printf("services metadata requested service_id=%s", h.cfg.ServiceID)
+	writeJSON(w, http.StatusOK, serviceResponse{
+		ID:            h.cfg.ServiceID,
+		Name:          h.cfg.ServiceName,
+		Description:   h.cfg.ServiceDescription,
+		MarketAddress: h.cfg.MarketAddress.Hex(),
+		SellerAddress: h.cfg.SellerAddress.Hex(),
+	})
 }
 
 func (h *Handler) handleOrderRequest(w http.ResponseWriter, r *http.Request) {
@@ -162,6 +183,7 @@ func (h *Handler) handleOrderRequest(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	log.Printf("buyer request stored order_id=%s request_hash=%s buyer=%s", orderID.String(), requestHash, order.Buyer.Hex())
 
 	txHash, err := h.market.ConfirmAsSeller(r.Context(), orderID)
 	if err != nil {
@@ -172,6 +194,7 @@ func (h *Handler) handleOrderRequest(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	log.Printf("seller confirmed order_id=%s tx_hash=%s", orderID.String(), txHash)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":              "seller_confirmed",
@@ -239,19 +262,23 @@ func (h *Handler) handleDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load local delivery body.
-	delivery, err := h.store.GetDelivery(r.Context(), orderID)
+	// Load local delivery body from the order row.
+	localOrder, err := h.store.GetOrder(r.Context(), orderID)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "delivery not found") {
+		if strings.Contains(err.Error(), "order not found") {
 			status = http.StatusNotFound
 		}
 		writeJSONError(w, status, err.Error())
 		return
 	}
+	if len(localOrder.DeliveryBody) == 0 {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("delivery not found: %s", orderID.String()))
+		return
+	}
 
 	// Verify local body hash matches on-chain deliveryHash.
-	bodyHash := agentcrypto.Keccak256(delivery.DeliveryBody)
+	bodyHash := agentcrypto.Keccak256(localOrder.DeliveryBody)
 	if !agentcrypto.EqualHash(bodyHash, order.DeliveryHash) {
 		writeJSONError(w, http.StatusConflict, "local delivery body hash does not match chain deliveryHash")
 		return
@@ -260,7 +287,8 @@ func (h *Handler) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	// Return raw delivery body.
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(delivery.DeliveryBody)
+	_, _ = w.Write(localOrder.DeliveryBody)
+	log.Printf("delivery returned order_id=%s bytes=%d", orderID.String(), len(localOrder.DeliveryBody))
 }
 
 func parseOrderID(value string) (*big.Int, error) {

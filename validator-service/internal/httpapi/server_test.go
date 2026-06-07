@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -217,47 +218,121 @@ func TestListDisputesEndpoint(t *testing.T) {
 	}
 }
 
-func TestGetDisputeEndpoint(t *testing.T) {
+func TestGetDisputeEndpointRequiresParticipantSignature(t *testing.T) {
 	db := seedDisputes(t)
-	handler := NewHandler(config.Config{}, &fakeMarket{}, db, fakeDecisionMaker{})
+	marketAddress := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	buyerKey := mustKey(t)
+	sellerKey := mustKey(t)
+	validatorKey := mustKey(t)
+	buyer := gethcrypto.PubkeyToAddress(buyerKey.PublicKey)
+	seller := gethcrypto.PubkeyToAddress(sellerKey.PublicKey)
+	validator := gethcrypto.PubkeyToAddress(validatorKey.PublicKey)
+	handler := NewHandler(
+		config.Config{MarketAddress: marketAddress},
+		&fakeMarket{order: chain.Order{Buyer: buyer, Seller: seller, Validator: validator}},
+		db,
+		fakeDecisionMaker{},
+	)
 
-	// 200 + plaintext bodies (regression guard: []byte must NOT be base64-encoded).
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/12", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("status mismatch: %d body=%s", response.Code, response.Body.String())
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/12", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without signature, got %d", unauthorized.Code)
 	}
-	raw := response.Body.String()
-	if !strings.Contains(raw, "the-request-plaintext") {
-		t.Fatalf("expected plaintext request in body: %s", raw)
+
+	for _, participant := range []struct {
+		name    string
+		key     *ecdsa.PrivateKey
+		address common.Address
+	}{
+		{"buyer", buyerKey, buyer},
+		{"seller", sellerKey, seller},
+		{"validator", validatorKey, validator},
+	} {
+		response := getSignedDisputeDetail(t, handler, marketAddress, big.NewInt(12), participant.key, participant.address)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status mismatch: %d body=%s", participant.name, response.Code, response.Body.String())
+		}
+		raw := response.Body.String()
+		if !strings.Contains(raw, "the-request-plaintext") {
+			t.Fatalf("expected plaintext request in body: %s", raw)
+		}
+		if strings.Contains(raw, base64.StdEncoding.EncodeToString([]byte("the-request-plaintext"))) {
+			t.Fatalf("request body was base64-encoded, expected plaintext: %s", raw)
+		}
+		var detail struct {
+			OrderID  string `json:"orderId"`
+			Request  string `json:"request"`
+			Delivery string `json:"delivery"`
+			Dispute  string `json:"dispute"`
+			Decision *struct {
+				Summary         string `json:"summary"`
+				ReleaseToSeller bool   `json:"releaseToSeller"`
+				Confidence      string `json:"confidence"`
+			} `json:"decision"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail.OrderID != "12" || detail.Request != "the-request-plaintext" {
+			t.Fatalf("detail mismatch: %+v", detail)
+		}
+		if detail.Decision == nil || detail.Decision.Summary != "release to seller" || !detail.Decision.ReleaseToSeller {
+			t.Fatalf("decision mismatch: %+v", detail.Decision)
+		}
 	}
-	if strings.Contains(raw, base64.StdEncoding.EncodeToString([]byte("the-request-plaintext"))) {
-		t.Fatalf("request body was base64-encoded, expected plaintext: %s", raw)
+
+	outsiderKey := mustKey(t)
+	outsider := gethcrypto.PubkeyToAddress(outsiderKey.PublicKey)
+	forbidden := getSignedDisputeDetail(t, handler, marketAddress, big.NewInt(12), outsiderKey, outsider)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for outsider, got %d body=%s", forbidden.Code, forbidden.Body.String())
 	}
-	var detail struct {
-		OrderID  string `json:"orderId"`
-		Request  string `json:"request"`
-		Delivery string `json:"delivery"`
-		Dispute  string `json:"dispute"`
-		Decision *struct {
-			Summary         string `json:"summary"`
-			ReleaseToSeller bool   `json:"releaseToSeller"`
-			Confidence      string `json:"confidence"`
-		} `json:"decision"`
+}
+
+func TestGetDisputeEndpointRejectsReplay(t *testing.T) {
+	db := seedDisputes(t)
+	marketAddress := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	buyerKey := mustKey(t)
+	buyer := gethcrypto.PubkeyToAddress(buyerKey.PublicKey)
+	handler := NewHandler(
+		config.Config{MarketAddress: marketAddress},
+		&fakeMarket{order: chain.Order{Buyer: buyer}},
+		db,
+		fakeDecisionMaker{},
+	)
+
+	orderID := big.NewInt(12)
+	nonce := requestAuthNonce(t, handler, buyer, orderID)
+	signature := signMessage(t, buyerKey, nonce.Message)
+	query := signedDetailQuery(buyer, nonce.Nonce, signature)
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/12?"+query, nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first request status=%d body=%s", first.Code, first.Body.String())
 	}
-	if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
-		t.Fatal(err)
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/12?"+query, nil))
+	if second.Code != http.StatusUnauthorized {
+		t.Fatalf("expected replay 401, got %d body=%s", second.Code, second.Body.String())
 	}
-	if detail.OrderID != "12" || detail.Request != "the-request-plaintext" {
-		t.Fatalf("detail mismatch: %+v", detail)
-	}
-	if detail.Decision == nil || detail.Decision.Summary != "release to seller" || !detail.Decision.ReleaseToSeller {
-		t.Fatalf("decision mismatch: %+v", detail.Decision)
-	}
+}
+
+func TestGetDisputeEndpointNotFoundAndBadID(t *testing.T) {
+	db := seedDisputes(t)
+	marketAddress := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	buyerKey := mustKey(t)
+	buyer := gethcrypto.PubkeyToAddress(buyerKey.PublicKey)
+	handler := NewHandler(
+		config.Config{MarketAddress: marketAddress},
+		&fakeMarket{order: chain.Order{Buyer: buyer}},
+		db,
+		fakeDecisionMaker{},
+	)
 
 	// 404 for a valid-but-unknown order id.
-	notFound := httptest.NewRecorder()
-	handler.ServeHTTP(notFound, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/999", nil))
+	notFound := getSignedDisputeDetail(t, handler, marketAddress, big.NewInt(999), buyerKey, buyer)
 	if notFound.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", notFound.Code)
 	}
@@ -318,6 +393,44 @@ func seedDisputes(t *testing.T) *store.Store {
 	return db
 }
 
+func getSignedDisputeDetail(t *testing.T, handler http.Handler, market common.Address, orderID *big.Int, key *ecdsa.PrivateKey, address common.Address) *httptest.ResponseRecorder {
+	t.Helper()
+	nonce := requestAuthNonce(t, handler, address, orderID)
+	wantMessage := agentcrypto.DisputeDetailAuthMessage(market, orderID, address, nonce.Nonce)
+	if nonce.Message != wantMessage {
+		t.Fatalf("auth message mismatch: %q", nonce.Message)
+	}
+	signature := signMessage(t, key, nonce.Message)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/agent-nexus/disputes/"+orderID.String()+"?"+signedDetailQuery(address, nonce.Nonce, signature), nil))
+	return response
+}
+
+func requestAuthNonce(t *testing.T, handler http.Handler, address common.Address, orderID *big.Int) nonceResponse {
+	t.Helper()
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/agent-nexus/auth/nonce?address="+address.Hex()+"&orderId="+orderID.String(), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("nonce status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body nonceResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Nonce == "" || body.Message == "" || body.ExpiresAt == "" {
+		t.Fatalf("nonce response incomplete: %+v", body)
+	}
+	return body
+}
+
+func signedDetailQuery(address common.Address, nonce string, signature string) string {
+	values := url.Values{}
+	values.Set("address", address.Hex())
+	values.Set("nonce", nonce)
+	values.Set("signature", signature)
+	return values.Encode()
+}
+
 func mustKey(t *testing.T) *ecdsa.PrivateKey {
 	t.Helper()
 	key, err := gethcrypto.GenerateKey()
@@ -330,6 +443,11 @@ func mustKey(t *testing.T) *ecdsa.PrivateKey {
 func signDisputeEvidence(t *testing.T, key *ecdsa.PrivateKey, market common.Address, orderID *big.Int, requestHash string, deliveryHash string, disputeHash string) string {
 	t.Helper()
 	message := agentcrypto.DisputeEvidenceMessage(market, orderID, requestHash, deliveryHash, disputeHash)
+	return signMessage(t, key, message)
+}
+
+func signMessage(t *testing.T, key *ecdsa.PrivateKey, message string) string {
+	t.Helper()
 	prefix := "\x19Ethereum Signed Message:\n" + strconv.Itoa(len(message))
 	hash := gethcrypto.Keccak256Hash([]byte(prefix + message))
 	signature, err := gethcrypto.Sign(hash.Bytes(), key)

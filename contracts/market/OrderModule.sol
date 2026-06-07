@@ -33,6 +33,7 @@ abstract contract OrderModule is MarketStorage {
             validator: validator,
             amount: amount,
             validatorFee: validatorFee,
+            validatorBond: 0,
             listingHash: listingHash,
             requestHash: requestHash,
             deliveryHash: bytes32(0),
@@ -57,16 +58,18 @@ abstract contract OrderModule is MarketStorage {
         );
     }
 
-    function confirmAsValidator(uint256 orderId) external {
+    function confirmAsValidator(uint256 orderId) external payable {
         Order storage order = orders[orderId];
         if (order.status != OrderStatus.PendingValidator) revert InvalidStatus();
         if (msg.sender != order.validator) revert Unauthorized();
         if (block.timestamp > order.approvalDeadline) revert ApprovalExpired();
+        if (msg.value != order.amount) revert InvalidPayment();
 
         uint256 deliveryTimeout = sellers[order.seller].deliveryTimeout;
         if (deliveryTimeout == 0) revert InvalidTimeout();
         uint256 deliveryDeadline = block.timestamp + deliveryTimeout;
 
+        order.validatorBond = msg.value;
         order.deliveryDeadline = deliveryDeadline;
         order.status = OrderStatus.Created;
 
@@ -104,13 +107,16 @@ abstract contract OrderModule is MarketStorage {
 
         uint256 amount = order.amount;
         uint256 validatorFee = order.validatorFee;
+        uint256 validatorBond = order.validatorBond;
         address seller = order.seller;
         address buyer = order.buyer;
+        address validator = order.validator;
 
         order.status = OrderStatus.Released;
 
         _sendETH(seller, amount);
         _sendETH(buyer, validatorFee);
+        _sendETH(validator, validatorBond);
 
         emit DeliveryAccepted(orderId);
     }
@@ -150,6 +156,7 @@ abstract contract OrderModule is MarketStorage {
 
         uint256 amount = order.amount;
         uint256 validatorFee = order.validatorFee;
+        uint256 validatorBond = order.validatorBond;
         address buyer = order.buyer;
         address seller = order.seller;
         address validator = order.validator;
@@ -158,9 +165,31 @@ abstract contract OrderModule is MarketStorage {
         order.status = releaseToSeller ? OrderStatus.ResolvedToSeller : OrderStatus.ResolvedToBuyer;
 
         _sendETH(releaseToSeller ? seller : buyer, amount);
-        _sendETH(validator, validatorFee);
+        _sendETH(validator, validatorFee + validatorBond);
 
         emit DisputeResolved(orderId, releaseToSeller, resolutionHash);
+    }
+
+    function splitIfResolutionExpired(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        if (order.status != OrderStatus.Disputed) revert InvalidStatus();
+        if (msg.sender != order.buyer && msg.sender != order.seller) revert Unauthorized();
+        if (block.timestamp <= order.responseDeadline) revert ResolutionNotExpired();
+
+        uint256 validatorFee = order.validatorFee;
+        uint256 splitPool = order.amount + order.validatorBond;
+        uint256 buyerShare = splitPool / 2;
+        uint256 sellerShare = splitPool - buyerShare;
+        uint256 buyerAmount = validatorFee + buyerShare;
+        address buyer = order.buyer;
+        address seller = order.seller;
+
+        order.status = OrderStatus.DisputeTimeoutSplit;
+
+        _sendETH(buyer, buyerAmount);
+        _sendETH(seller, sellerShare);
+
+        emit ResolutionExpiredSplit(orderId, buyerAmount, sellerShare, validatorFee);
     }
 
     function refundIfDeliveryExpired(uint256 orderId) external {
@@ -170,13 +199,14 @@ abstract contract OrderModule is MarketStorage {
 
         uint256 amount = order.amount;
         uint256 validatorFee = order.validatorFee;
+        uint256 validatorBond = order.validatorBond;
         address buyer = order.buyer;
         address validator = order.validator;
 
         order.status = OrderStatus.DeliveryExpiredRefunded;
 
         _sendETH(buyer, amount);
-        _sendETH(validator, validatorFee);
+        _sendETH(validator, validatorFee + validatorBond);
 
         emit DeliveryExpiredRefunded(orderId);
     }

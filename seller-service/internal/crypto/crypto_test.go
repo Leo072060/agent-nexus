@@ -53,6 +53,33 @@ func TestRecoverSigner(t *testing.T) {
 	}
 }
 
+func TestSignEvidenceMessage(t *testing.T) {
+	privateKey, err := gethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := gethcrypto.PubkeyToAddress(privateKey.PublicKey)
+	message := EvidenceMessage(
+		common.HexToAddress("0x1234567890123456789012345678901234567890"),
+		big.NewInt(12),
+		"0xREQUEST",
+		"0xDELIVERY",
+		"0xEVIDENCE",
+	)
+
+	signature, err := SignMessage(privateKey, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := RecoverSigner(message, signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("signer mismatch: want %s got %s", want.Hex(), got.Hex())
+	}
+}
+
 func TestKeccak256Hex(t *testing.T) {
 	got := Keccak256Hex([]byte("hello"))
 	want := "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"

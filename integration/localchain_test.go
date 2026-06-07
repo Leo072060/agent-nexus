@@ -37,13 +37,14 @@ const (
 	validatorKeyHex = "0000000000000000000000000000000000000000000000000000000000000004"
 	outsiderKeyHex  = "0000000000000000000000000000000000000000000000000000000000000005"
 
-	statusPendingValidator  = uint8(2)
-	statusCreated           = uint8(3)
-	statusDeliveryCommitted = uint8(4)
-	statusDisputed          = uint8(5)
-	statusReleased          = uint8(6)
-	statusResolvedToSeller  = uint8(9)
-	statusResolvedToBuyer   = uint8(10)
+	statusPendingValidator    = uint8(2)
+	statusCreated             = uint8(3)
+	statusDeliveryCommitted   = uint8(4)
+	statusDisputed            = uint8(5)
+	statusReleased            = uint8(6)
+	statusResolvedToSeller    = uint8(9)
+	statusResolvedToBuyer     = uint8(10)
+	statusDisputeTimeoutSplit = uint8(11)
 )
 
 var (
@@ -88,6 +89,7 @@ type orderView struct {
 	Validator        common.Address
 	Amount           *big.Int
 	ValidatorFee     *big.Int
+	ValidatorBond    *big.Int
 	ListingHash      [32]byte
 	RequestHash      [32]byte
 	DeliveryHash     [32]byte
@@ -105,20 +107,29 @@ func TestLocalChainContractLifecycle(t *testing.T) {
 
 	orderID := h.createOrder(h.buyer, h.seller.address, h.validator.address, hash32("request-ok"), approvalTimeout, new(big.Int).Add(price, validatorFee))
 	h.tx(h.seller, big.NewInt(0), "confirmAsSeller", orderID)
-	h.tx(h.validator, big.NewInt(0), "confirmAsValidator", orderID)
+	h.tx(h.validator, price, "confirmAsValidator", orderID)
+	if bond := h.getOrder(orderID).ValidatorBond; bond.Cmp(price) != 0 {
+		t.Fatalf("validator bond got %s want %s", bond, price)
+	}
 	h.tx(h.seller, big.NewInt(0), "commitDelivery", orderID, hash32("delivery-ok"))
+	validatorBeforeAccept := h.balance(h.validator.address)
 	h.tx(h.buyer, big.NewInt(0), "acceptDelivery", orderID)
 	h.assertOrderStatus(orderID, statusReleased)
+	h.assertBalanceDelta(h.validator.address, validatorBeforeAccept, price)
 
 	sellerDisputeID := h.createCommittedOrder(hash32("seller-dispute"), hash32("seller-delivery"))
 	h.tx(h.seller, big.NewInt(0), "openDispute", sellerDisputeID)
-	h.tx(h.validator, big.NewInt(0), "resolveDispute", sellerDisputeID, true, hash32("seller-wins"))
+	validatorBeforeSellerResolution := h.balance(h.validator.address)
+	sellerResolutionReceipt := h.tx(h.validator, big.NewInt(0), "resolveDispute", sellerDisputeID, true, hash32("seller-wins"))
 	h.assertOrderStatus(sellerDisputeID, statusResolvedToSeller)
+	h.assertBalanceDeltaWithGas(h.validator.address, validatorBeforeSellerResolution, sellerResolutionReceipt, new(big.Int).Add(validatorFee, price))
 
 	buyerDisputeID := h.createCommittedOrder(hash32("buyer-dispute"), hash32("bad-delivery"))
 	h.tx(h.buyer, big.NewInt(0), "openDispute", buyerDisputeID)
-	h.tx(h.validator, big.NewInt(0), "resolveDispute", buyerDisputeID, false, hash32("buyer-wins"))
+	validatorBeforeBuyerResolution := h.balance(h.validator.address)
+	buyerResolutionReceipt := h.tx(h.validator, big.NewInt(0), "resolveDispute", buyerDisputeID, false, hash32("buyer-wins"))
 	h.assertOrderStatus(buyerDisputeID, statusResolvedToBuyer)
+	h.assertBalanceDeltaWithGas(h.validator.address, validatorBeforeBuyerResolution, buyerResolutionReceipt, new(big.Int).Add(validatorFee, price))
 }
 
 func TestLocalChainTimeoutsAndFailures(t *testing.T) {
@@ -131,18 +142,28 @@ func TestLocalChainTimeoutsAndFailures(t *testing.T) {
 
 	deliveryID := h.createOrder(h.buyer, h.seller.address, h.validator.address, hash32("delivery-timeout"), approvalTimeout, new(big.Int).Add(price, validatorFee))
 	h.tx(h.seller, big.NewInt(0), "confirmAsSeller", deliveryID)
-	h.tx(h.validator, big.NewInt(0), "confirmAsValidator", deliveryID)
+	h.expectTxRevert(h.validator, "confirmAsValidator", deliveryID)
+	h.expectTxRevertWithValue(h.validator, big.NewInt(1), "confirmAsValidator", deliveryID)
+	h.tx(h.validator, price, "confirmAsValidator", deliveryID)
 	h.increaseTime(new(big.Int).Add(deliveryTimeout, big.NewInt(1)))
+	validatorBeforeDeliveryRefund := h.balance(h.validator.address)
 	h.tx(h.outsider, big.NewInt(0), "refundIfDeliveryExpired", deliveryID)
+	h.assertBalanceDelta(h.validator.address, validatorBeforeDeliveryRefund, new(big.Int).Add(validatorFee, price))
 
 	disputeAfterExpiryID := h.createOrder(h.buyer, h.seller.address, h.validator.address, hash32("delivery-timeout-dispute"), approvalTimeout, new(big.Int).Add(price, validatorFee))
 	h.tx(h.seller, big.NewInt(0), "confirmAsSeller", disputeAfterExpiryID)
-	h.tx(h.validator, big.NewInt(0), "confirmAsValidator", disputeAfterExpiryID)
+	h.tx(h.validator, price, "confirmAsValidator", disputeAfterExpiryID)
 	h.increaseTime(new(big.Int).Add(deliveryTimeout, big.NewInt(1)))
 	h.tx(h.buyer, big.NewInt(0), "openDispute", disputeAfterExpiryID)
 	h.assertOrderStatus(disputeAfterExpiryID, statusDisputed)
+	h.expectTxRevert(h.outsider, "splitIfResolutionExpired", disputeAfterExpiryID)
 	h.increaseTime(new(big.Int).Add(responseTimeout, big.NewInt(1)))
 	h.expectTxRevert(h.validator, "resolveDispute", disputeAfterExpiryID, false, hash32("too-late"))
+	buyerBeforeSplit := h.balance(h.buyer.address)
+	h.tx(h.seller, big.NewInt(0), "splitIfResolutionExpired", disputeAfterExpiryID)
+	h.assertOrderStatus(disputeAfterExpiryID, statusDisputeTimeoutSplit)
+	h.assertBalanceDelta(h.buyer.address, buyerBeforeSplit, new(big.Int).Add(validatorFee, price))
+	h.expectTxRevert(h.validator, "resolveDispute", disputeAfterExpiryID, false, hash32("too-late-again"))
 
 	h.expectTxRevert(h.outsider, "confirmAsSeller", h.createOrder(h.buyer, h.seller.address, h.validator.address, hash32("auth"), approvalTimeout, new(big.Int).Add(price, validatorFee)))
 	h.expectTxRevert(h.buyer, "createOrder", h.seller.address, h.validator.address, [32]byte{}, approvalTimeout)
@@ -162,14 +183,26 @@ func TestSellerServiceDeliveryFlow(t *testing.T) {
 
 	sellerAddr := strings.TrimPrefix(sellerURL, "http://127.0.0.1")
 	sellerDB := filepath.Join(t.TempDir(), "seller.db")
+	sellerLLMScript := writeSellerLLMScript(t)
 	sellerProc := startProcess(t, "../seller-service", []string{"go", "run", "./cmd/seller-service", "serve"}, append(os.Environ(),
 		"SELLER_RPC_URL="+h.rpcURL,
 		"SELLER_MARKET_ADDRESS="+h.marketAddress.Hex(),
 		"SELLER_PRIVATE_KEY="+sellerKeyHex,
 		"SELLER_BASE_URL="+sellerURL,
+		"SELLER_URI="+sellerURL,
+		"SELLER_PRICE_WEI="+price.String(),
+		"SELLER_CONTENT_URI=http://content",
+		"SELLER_CONTENT_HASH="+hexHash(hash32("content")),
+		"SELLER_DELIVERY_TIMEOUT="+deliveryTimeout.String(),
+		"SELLER_SUPPORTED_VALIDATORS="+h.validator.address.Hex(),
+		"SELLER_SERVICE_ID=integration-seller",
+		"SELLER_SERVICE_NAME=Integration Seller",
+		"SELLER_SERVICE_DESCRIPTION=Integration test seller service",
 		"SELLER_DB_PATH="+sellerDB,
 		"SELLER_HTTP_ADDR="+sellerAddr,
 		"SELLER_POLL_INTERVAL=200ms",
+		"SELLER_LLM_SCRIPT="+sellerLLMScript,
+		"SELLER_LLM_API_KEY=integration-test-key",
 	))
 	defer sellerProc.stop()
 	waitHTTP(t, sellerURL+"/health")
@@ -179,7 +212,7 @@ func TestSellerServiceDeliveryFlow(t *testing.T) {
 	orderID := h.createOrder(h.buyer, h.seller.address, h.validator.address, requestHash, approvalTimeout, new(big.Int).Add(price, validatorFee))
 	orderSig := signPersonal(t, h.buyer.key, orderRequestMessage(h.marketAddress, orderID, hexHash(requestHash)))
 
-	postJSON(t, sellerURL+"/agent-nexus/orders/request", map[string]string{
+	postJSON(t, sellerURL+"/agent-nexus/request", map[string]string{
 		"marketAddress": h.marketAddress.Hex(),
 		"orderId":       orderID.String(),
 		"request":       requestBody,
@@ -187,7 +220,7 @@ func TestSellerServiceDeliveryFlow(t *testing.T) {
 	}, http.StatusOK)
 	h.waitOrderStatus(orderID, statusPendingValidator, 5*time.Second)
 
-	h.tx(h.validator, big.NewInt(0), "confirmAsValidator", orderID)
+	h.tx(h.validator, price, "confirmAsValidator", orderID)
 	h.waitOrderStatus(orderID, statusDeliveryCommitted, 10*time.Second)
 
 	deliverySig := signPersonal(t, h.buyer.key, deliveryRequestMessage(h.marketAddress, orderID))
@@ -203,18 +236,14 @@ func TestSellerServiceDeliveryFlow(t *testing.T) {
 	}
 }
 
-func TestValidatorServiceWithDeepSeek(t *testing.T) {
-	apiKey := strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
-	if apiKey == "" {
-		t.Skip("DEEPSEEK_API_KEY is not set; skipping real DeepSeek validator-service test")
-	}
-
+func TestValidatorServiceWithScript(t *testing.T) {
 	h := newHarness(t)
 	validatorURL := "http://127.0.0.1:" + freePort(t)
 	h.registerSellerAndValidator("http://seller", validatorURL)
 
 	validatorAddr := strings.TrimPrefix(validatorURL, "http://127.0.0.1")
 	validatorDB := filepath.Join(t.TempDir(), "validator.db")
+	llmScript := writeValidatorLLMScript(t)
 	validatorProc := startProcess(t, "../validator-service", []string{"go", "run", "./cmd/validator-service", "serve"}, append(os.Environ(),
 		"VALIDATOR_RPC_URL="+h.rpcURL,
 		"VALIDATOR_MARKET_ADDRESS="+h.marketAddress.Hex(),
@@ -222,7 +251,9 @@ func TestValidatorServiceWithDeepSeek(t *testing.T) {
 		"VALIDATOR_BASE_URL="+validatorURL,
 		"VALIDATOR_DB_PATH="+validatorDB,
 		"VALIDATOR_HTTP_ADDR="+validatorAddr,
-		"DEEPSEEK_API_KEY="+apiKey,
+		"VALIDATOR_LLM_SCRIPT="+llmScript,
+		"VALIDATOR_LLM_API_KEY=integration-test-key",
+		"VALIDATOR_LLM_TIMEOUT=5s",
 	))
 	defer validatorProc.stop()
 	waitHTTP(t, validatorURL+"/health")
@@ -248,9 +279,6 @@ func TestValidatorServiceWithDeepSeek(t *testing.T) {
 		"signature":     signature,
 	})
 	if status != http.StatusOK {
-		if status == http.StatusBadGateway || bytes.Contains(respBody, []byte("LLM decision")) || bytes.Contains(respBody, []byte("DeepSeek")) {
-			t.Skipf("DeepSeek validator-service call unavailable: status=%d body=%s", status, string(respBody))
-		}
 		t.Fatalf("validator dispute status=%d body=%s", status, string(respBody))
 	}
 
@@ -362,7 +390,7 @@ func (h *chainHarness) fundTestAccounts() {
 func (h *chainHarness) createCommittedOrder(requestHash [32]byte, deliveryHash [32]byte) *big.Int {
 	orderID := h.createOrder(h.buyer, h.seller.address, h.validator.address, requestHash, approvalTimeout, new(big.Int).Add(price, validatorFee))
 	h.tx(h.seller, big.NewInt(0), "confirmAsSeller", orderID)
-	h.tx(h.validator, big.NewInt(0), "confirmAsValidator", orderID)
+	h.tx(h.validator, price, "confirmAsValidator", orderID)
 	h.tx(h.seller, big.NewInt(0), "commitDelivery", orderID, deliveryHash)
 	return orderID
 }
@@ -470,6 +498,7 @@ func (h *chainHarness) getOrder(orderID *big.Int) orderView {
 		Validator:        value.FieldByName("Validator").Interface().(common.Address),
 		Amount:           value.FieldByName("Amount").Interface().(*big.Int),
 		ValidatorFee:     value.FieldByName("ValidatorFee").Interface().(*big.Int),
+		ValidatorBond:    value.FieldByName("ValidatorBond").Interface().(*big.Int),
 		ListingHash:      value.FieldByName("ListingHash").Interface().([32]byte),
 		RequestHash:      value.FieldByName("RequestHash").Interface().([32]byte),
 		DeliveryHash:     value.FieldByName("DeliveryHash").Interface().([32]byte),
@@ -504,6 +533,35 @@ func (h *chainHarness) assertOrderStatus(orderID *big.Int, want uint8) {
 	got := h.getOrder(orderID).Status
 	if got != want {
 		h.t.Fatalf("order %s status got %d want %d", orderID, got, want)
+	}
+}
+
+func (h *chainHarness) balance(address common.Address) *big.Int {
+	h.t.Helper()
+	balance, err := h.client.BalanceAt(h.ctx, address, nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return balance
+}
+
+func (h *chainHarness) assertBalanceDelta(address common.Address, before *big.Int, wantDelta *big.Int) {
+	h.t.Helper()
+	after := h.balance(address)
+	gotDelta := new(big.Int).Sub(after, before)
+	if gotDelta.Cmp(wantDelta) != 0 {
+		h.t.Fatalf("balance delta for %s got %s want %s", address.Hex(), gotDelta, wantDelta)
+	}
+}
+
+func (h *chainHarness) assertBalanceDeltaWithGas(address common.Address, before *big.Int, receipt *types.Receipt, wantDelta *big.Int) {
+	h.t.Helper()
+	after := h.balance(address)
+	gotDelta := new(big.Int).Sub(after, before)
+	gasCost := new(big.Int).Mul(new(big.Int).SetUint64(receipt.GasUsed), receipt.EffectiveGasPrice)
+	gotDelta.Add(gotDelta, gasCost)
+	if gotDelta.Cmp(wantDelta) != 0 {
+		h.t.Fatalf("balance delta plus gas for %s got %s want %s", address.Hex(), gotDelta, wantDelta)
 	}
 }
 
@@ -569,6 +627,26 @@ func deliveryRequestMessage(marketAddress common.Address, orderID *big.Int) stri
 
 func disputeEvidenceMessage(marketAddress common.Address, orderID *big.Int, requestHash string, deliveryHash string, disputeHash string) string {
 	return fmt.Sprintf("Agent Nexus dispute evidence\nmarketAddress: %s\norderId: %s\nrequestHash: %s\ndeliveryHash: %s\ndisputeHash: %s", marketAddress.Hex(), orderID, strings.ToLower(requestHash), strings.ToLower(deliveryHash), strings.ToLower(disputeHash))
+}
+
+func writeSellerLLMScript(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "seller-llm.sh")
+	content := "#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s\\n' '{\"answer\":\"integration delivery\",\"evidence\":\"integration evidence\"}'\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeValidatorLLMScript(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "validator-llm.sh")
+	content := "#!/usr/bin/env bash\nset -euo pipefail\ninput=$(cat)\ncase \"$input\" in *'\"orderId\"'* ) ;; *) echo 'missing orderId' >&2; exit 2 ;; esac\nif [ \"${VALIDATOR_LLM_API_KEY:-}\" != \"integration-test-key\" ]; then echo 'unexpected api key' >&2; exit 3; fi\nprintf '%s\\n' '{\"releaseToSeller\":true,\"summary\":\"seller wins\",\"reasoning\":\"delivery satisfies the request\",\"buyerClaim\":\"delivery should pass\",\"sellerDeliveryAssessment\":\"sufficient\",\"confidence\":\"high\"}'\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func waitRPC(t *testing.T, rpcURL string) *ethclient.Client {

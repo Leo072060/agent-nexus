@@ -6,16 +6,16 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
 const (
-	defaultDBPath          = "./validator-service.db"
-	defaultHTTPAddr        = ":8082"
-	defaultDeepSeekBaseURL = "https://api.deepseek.com"
-	defaultDeepSeekModel   = "deepseek-chat"
+	defaultDBPath     = "./validator-service.db"
+	defaultHTTPAddr   = ":8082"
+	defaultLLMTimeout = 60 * time.Second
 )
 
 type Config struct {
@@ -26,9 +26,9 @@ type Config struct {
 	ValidatorBaseURL    string
 	DBPath              string
 	HTTPAddr            string
-	DeepSeekAPIKey      string
-	DeepSeekBaseURL     string
-	DeepSeekModel       string
+	LLMScript           string
+	LLMAPIKey           string
+	LLMTimeout          time.Duration
 }
 
 func Load() (Config, error) {
@@ -38,9 +38,9 @@ func Load() (Config, error) {
 	validatorBaseURL := strings.TrimSpace(os.Getenv("VALIDATOR_BASE_URL"))
 	dbPath := strings.TrimSpace(os.Getenv("VALIDATOR_DB_PATH"))
 	httpAddr := strings.TrimSpace(os.Getenv("VALIDATOR_HTTP_ADDR"))
-	deepSeekAPIKey := strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
-	deepSeekBaseURL := strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL"))
-	deepSeekModel := strings.TrimSpace(os.Getenv("DEEPSEEK_MODEL"))
+	llmScript := strings.TrimSpace(os.Getenv("VALIDATOR_LLM_SCRIPT"))
+	llmAPIKey := strings.TrimSpace(os.Getenv("VALIDATOR_LLM_API_KEY"))
+	llmTimeoutText := strings.TrimSpace(os.Getenv("VALIDATOR_LLM_TIMEOUT"))
 
 	var missing []string
 	if rpcURL == "" {
@@ -55,8 +55,11 @@ func Load() (Config, error) {
 	if validatorBaseURL == "" {
 		missing = append(missing, "VALIDATOR_BASE_URL")
 	}
-	if deepSeekAPIKey == "" {
-		missing = append(missing, "DEEPSEEK_API_KEY")
+	if llmScript == "" {
+		missing = append(missing, "VALIDATOR_LLM_SCRIPT")
+	}
+	if llmAPIKey == "" {
+		missing = append(missing, "VALIDATOR_LLM_API_KEY")
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required env: %s", strings.Join(missing, ", "))
@@ -70,11 +73,16 @@ func Load() (Config, error) {
 	if httpAddr == "" {
 		httpAddr = defaultHTTPAddr
 	}
-	if deepSeekBaseURL == "" {
-		deepSeekBaseURL = defaultDeepSeekBaseURL
-	}
-	if deepSeekModel == "" {
-		deepSeekModel = defaultDeepSeekModel
+	llmTimeout := defaultLLMTimeout
+	if llmTimeoutText != "" {
+		parsed, err := time.ParseDuration(llmTimeoutText)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse VALIDATOR_LLM_TIMEOUT: %w", err)
+		}
+		if parsed <= 0 {
+			return Config{}, errors.New("VALIDATOR_LLM_TIMEOUT must be positive")
+		}
+		llmTimeout = parsed
 	}
 
 	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(privateKeyHex, "0x"))
@@ -90,8 +98,8 @@ func Load() (Config, error) {
 		ValidatorBaseURL:    validatorBaseURL,
 		DBPath:              dbPath,
 		HTTPAddr:            httpAddr,
-		DeepSeekAPIKey:      deepSeekAPIKey,
-		DeepSeekBaseURL:     strings.TrimRight(deepSeekBaseURL, "/"),
-		DeepSeekModel:       deepSeekModel,
+		LLMScript:           llmScript,
+		LLMAPIKey:           llmAPIKey,
+		LLMTimeout:          llmTimeout,
 	}, nil
 }

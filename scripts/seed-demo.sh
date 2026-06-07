@@ -14,7 +14,7 @@
 #        #5 裁决给卖家        (validator ME) —— 私有库里有完整 LLM 裁决
 #        #6 裁决给买家        (validator OTHER) —— 看板显示“私有过程不可见”
 #   5) 直接把 #4/#5 的私有判决数据写进 validator-service 的 SQLite
-#   6) 写好 frontend/.env，并打印下一步命令
+#   6) 写好 cli-frontend/.env，并打印下一步命令
 #
 # 用法：
 #   bash scripts/seed-demo.sh           # 对全新 anvil 运行（推荐）
@@ -65,8 +65,8 @@ else
     cast block-number --rpc-url "$RPC" >/dev/null 2>&1 && { ready=1; break; }
     sleep 0.2 2>/dev/null || true
   done
-  [ "$ready" = 1 ] || { echo "anvil 启动失败，见 $ANVIL_LOG"; exit 1; }
-  echo "    anvil 已启动（日志 $ANVIL_LOG）"
+  [ "$ready" = 1 ] || { echo "anvil 启动失败，见 ${ANVIL_LOG}"; exit 1; }
+  echo "    anvil 已启动（日志 ${ANVIL_LOG}）"
 fi
 
 # 金额（wei）与超时（秒，给足 1 年，演示期间不过期）
@@ -135,26 +135,26 @@ create_order "$K5" "$SELLER_A" "$VAL_ME" "$RH1" "$((PRICE_A+FEE_ME))"
 # #2 Created — buyer A, seller A, validator OTHER
 create_order "$K5" "$SELLER_A" "$VAL_OTHER" "$RH2" "$((PRICE_A+FEE_OTHER))"
 snd "$K1" "$MARKET" "confirmAsSeller(uint256)" 2
-snd "$K4" "$MARKET" "confirmAsValidator(uint256)" 2
+snd "$K4" "$MARKET" "confirmAsValidator(uint256)" 2 --value "$PRICE_A"
 
 # #3 Released — buyer B, seller B, validator ME
 create_order "$K6" "$SELLER_B" "$VAL_ME" "$RH3" "$((PRICE_B+FEE_ME))"
 snd "$K2" "$MARKET" "confirmAsSeller(uint256)" 3
-snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 3
+snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 3 --value "$PRICE_B"
 snd "$K2" "$MARKET" "commitDelivery(uint256,bytes32)" 3 "$DH3"
 snd "$K6" "$MARKET" "acceptDelivery(uint256)" 3
 
 # #4 Disputed (进行中) — buyer B, seller A, validator ME
 create_order "$K6" "$SELLER_A" "$VAL_ME" "$RH4" "$((PRICE_A+FEE_ME))"
 snd "$K1" "$MARKET" "confirmAsSeller(uint256)" 4
-snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 4
+snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 4 --value "$PRICE_A"
 snd "$K1" "$MARKET" "commitDelivery(uint256,bytes32)" 4 "$DH4"
 snd "$K6" "$MARKET" "openDispute(uint256)" 4
 
 # #5 ResolvedToSeller — buyer A, seller A, validator ME
 create_order "$K5" "$SELLER_A" "$VAL_ME" "$RH5" "$((PRICE_A+FEE_ME))"
 snd "$K1" "$MARKET" "confirmAsSeller(uint256)" 5
-snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 5
+snd "$K3" "$MARKET" "confirmAsValidator(uint256)" 5 --value "$PRICE_A"
 snd "$K1" "$MARKET" "commitDelivery(uint256,bytes32)" 5 "$DH5"
 snd "$K5" "$MARKET" "openDispute(uint256)" 5
 DECISION5='{"releaseToSeller":true,"summary":"交付完整且符合请求，判给卖家。","reasoning":"译文覆盖全部 500 字，术语前后一致；买家未能指出任何具体错误句子，主张缺乏依据。","buyerClaim":"声称翻译有误但无具体例证","sellerDeliveryAssessment":"完整、术语一致、符合请求","confidence":"high"}'
@@ -164,7 +164,7 @@ TX5=$(sndtx "$K3" "$MARKET" "resolveDispute(uint256,bool,bytes32)" 5 true "$RES5
 # #6 ResolvedToBuyer — buyer B, seller B, validator OTHER（非“我”，看板不展示私有过程）
 create_order "$K6" "$SELLER_B" "$VAL_OTHER" "$RH6" "$((PRICE_B+FEE_OTHER))"
 snd "$K2" "$MARKET" "confirmAsSeller(uint256)" 6
-snd "$K4" "$MARKET" "confirmAsValidator(uint256)" 6
+snd "$K4" "$MARKET" "confirmAsValidator(uint256)" 6 --value "$PRICE_B"
 snd "$K2" "$MARKET" "commitDelivery(uint256,bytes32)" 6 "$DH6"
 snd "$K6" "$MARKET" "openDispute(uint256)" 6
 RES6=$(cast keccak "ruling-order-6-refund-buyer")
@@ -211,13 +211,12 @@ VALUES
   1, '$TX5', 'resolved', '$NOW', '$NOW');
 SQL
 
-# --- 6) 写 frontend/.env ---
-echo "[6/6] 写 frontend/.env…"
-cat > "$ROOT/frontend/.env" <<ENV
-VITE_RPC_URL=http://localhost:8545
+# --- 6) 写 cli-frontend/.env ---
+echo "[6/6] 写 cli-frontend/.env…"
+mkdir -p "$ROOT/cli-frontend"
+cat > "$ROOT/cli-frontend/.env" <<ENV
+VITE_RPC_URL=http://127.0.0.1:8545
 VITE_MARKET_ADDRESS=$MARKET
-VITE_VALIDATOR_API_BASE_URL=http://localhost:8082
-VITE_DEFAULT_VIEW_AS=$VAL_ME
 VITE_POLL_MS=8000
 ENV
 
@@ -225,7 +224,7 @@ cat <<DONE
 
 ==================== 演示数据就绪 ====================
 Market 合约 : $MARKET
-RPC         : http://localhost:8545
+RPC         : http://127.0.0.1:8545
 “我”(validator ME) 地址 : $VAL_ME
 “我”(validator ME) 私钥 : $K3
 
@@ -241,16 +240,17 @@ RPC         : http://localhost:8545
 
   # ① 启动 validator-service（读私有判决数据）
   cd "$ROOT/validator-service" && \\
-  VALIDATOR_RPC_URL=http://localhost:8545 \\
+  VALIDATOR_RPC_URL=http://127.0.0.1:8545 \\
   VALIDATOR_MARKET_ADDRESS=$MARKET \\
   VALIDATOR_PRIVATE_KEY=$K3 \\
   VALIDATOR_BASE_URL=http://localhost:8082 \\
-  DEEPSEEK_API_KEY=dummy-not-used-for-reads \\
+  VALIDATOR_LLM_SCRIPT=/bin/false \\
+  VALIDATOR_LLM_API_KEY=dummy-not-used-for-reads \\
   go run ./cmd/validator-service serve
 
-  # ② 启动前端看板
-  cd "$ROOT/frontend" && npm run dev   # http://localhost:5173
+  # ② 启动 CLI 用户市场前端
+  cd "$ROOT/cli-frontend" && npm run dev   # http://localhost:5173
 
-frontend/.env 已自动写好。anvil 在后台运行；停止：pkill -f 'anvil --silent'
+cli-frontend/.env 已自动写好。anvil 在后台运行；停止：pkill -f 'anvil --silent'
 =====================================================
 DONE

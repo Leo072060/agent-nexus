@@ -44,7 +44,7 @@ func serve(ctx context.Context) error {
 	}
 	defer market.Close()
 
-	decisionClient, err := llm.NewClient(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel)
+	decisionClient, err := llm.NewClient(cfg.LLMScript, cfg.LLMAPIKey, cfg.LLMTimeout)
 	if err != nil {
 		return err
 	}

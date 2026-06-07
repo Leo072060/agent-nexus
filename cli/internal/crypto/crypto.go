@@ -20,6 +20,15 @@ func DeliveryRequestMessage(marketAddress common.Address, orderID *big.Int) stri
 	)
 }
 
+func OrderRequestMessage(marketAddress common.Address, orderID *big.Int, requestHash string) string {
+	return fmt.Sprintf(
+		"Agent Nexus order request\nmarketAddress: %s\norderId: %s\nrequestHash: %s",
+		marketAddress.Hex(),
+		orderID.String(),
+		strings.ToLower(requestHash),
+	)
+}
+
 func DisputeEvidenceMessage(marketAddress common.Address, orderID *big.Int, requestHash string, deliveryHash string, disputeHash string) string {
 	return fmt.Sprintf(
 		"Agent Nexus dispute evidence\nmarketAddress: %s\norderId: %s\nrequestHash: %s\ndeliveryHash: %s\ndisputeHash: %s",

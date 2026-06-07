@@ -13,7 +13,8 @@ abstract contract MarketStorage {
         ApprovalExpiredRefunded,
         DeliveryExpiredRefunded,
         ResolvedToSeller,
-        ResolvedToBuyer
+        ResolvedToBuyer,
+        DisputeTimeoutSplit
     }
 
     struct Seller {
@@ -40,6 +41,7 @@ abstract contract MarketStorage {
         address validator;
         uint256 amount;
         uint256 validatorFee;
+        uint256 validatorBond;
         bytes32 listingHash;
         bytes32 requestHash;
         bytes32 deliveryHash;
@@ -71,6 +73,7 @@ abstract contract MarketStorage {
     error ApprovalExpired();
     error ApprovalNotExpired();
     error ResolutionExpired();
+    error ResolutionNotExpired();
     error TransferFailed();
 
     event SellerRegistered(address indexed seller, string sellerURI);
@@ -116,6 +119,12 @@ abstract contract MarketStorage {
     event DisputeResolved(uint256 indexed orderId, bool releaseToSeller, bytes32 resolutionHash);
     event ApprovalExpiredRefunded(uint256 indexed orderId);
     event DeliveryExpiredRefunded(uint256 indexed orderId);
+    event ResolutionExpiredSplit(
+        uint256 indexed orderId,
+        uint256 buyerAmount,
+        uint256 sellerAmount,
+        uint256 validatorFeeRefunded
+    );
 
     mapping(address => Seller) internal sellers;
     mapping(address => address[]) internal sellerValidators;

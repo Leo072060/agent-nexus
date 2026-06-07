@@ -64,6 +64,17 @@ type CreateMarketInput struct {
 	MarketAddress string
 }
 
+type CreateOrderInput struct {
+	RPCURL         string
+	MarketAddress  string
+	ChainOrderID   *big.Int
+	BuyerAddress   string
+	SellerURI      string
+	ValidatorURI   string
+	RequestContent string
+	Status         string
+}
+
 func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, errors.New("database path is required")
@@ -139,6 +150,85 @@ CREATE TABLE IF NOT EXISTS orders (
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return fmt.Errorf("migrate database: %w", err)
 		}
+	}
+
+	return nil
+}
+
+func (s *Store) CreateOrder(ctx context.Context, input CreateOrderInput) (Order, error) {
+	if input.ChainOrderID == nil || input.ChainOrderID.Sign() <= 0 {
+		return Order{}, fmt.Errorf("chain order id is required")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO orders (
+	rpc_url,
+	market_address,
+	chain_order_id,
+	buyer_address,
+	seller_uri,
+	validator_uri,
+	request_content,
+	status,
+	created_at,
+	updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		input.RPCURL,
+		input.MarketAddress,
+		input.ChainOrderID.String(),
+		input.BuyerAddress,
+		input.SellerURI,
+		input.ValidatorURI,
+		input.RequestContent,
+		input.Status,
+		now,
+		now,
+	)
+	if err != nil {
+		return Order{}, fmt.Errorf("insert order: %w", err)
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Order{}, fmt.Errorf("get order id: %w", err)
+	}
+
+	return Order{
+		ID:             id,
+		RPCURL:         input.RPCURL,
+		MarketAddress:  input.MarketAddress,
+		ChainOrderID:   new(big.Int).Set(input.ChainOrderID),
+		BuyerAddress:   input.BuyerAddress,
+		SellerURI:      input.SellerURI,
+		ValidatorURI:   input.ValidatorURI,
+		RequestContent: input.RequestContent,
+		Status:         input.Status,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}, nil
+}
+
+func (s *Store) UpdateOrderStatus(ctx context.Context, id int64, status string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE orders SET status = ?, updated_at = ? WHERE id = ?`,
+		status,
+		now,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("update order status: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check updated order: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("order not found: %d", id)
 	}
 
 	return nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -17,6 +18,7 @@ import (
 	agentcrypto "agent-nexus-cli/internal/crypto"
 	"agent-nexus-cli/internal/store"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/spf13/cobra"
 )
@@ -27,9 +29,171 @@ func NewOrdersCommand(cfg *AppConfig) *cobra.Command {
 		Short: "Manage buyer orders",
 	}
 
+	cmd.AddCommand(newOrdersCreateCommand(cfg))
 	cmd.AddCommand(newOrdersWatchCommand(cfg))
 	cmd.AddCommand(newOrdersDisputeCommand(cfg))
 
+	return cmd
+}
+
+func newOrdersCreateCommand(cfg *AppConfig) *cobra.Command {
+	var sellerAddressText string
+	var validatorAddressText string
+	var requestText string
+	var requestFile string
+	var approvalTimeoutSeconds int64
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create an on-chain order and submit the request to the seller",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !common.IsHexAddress(sellerAddressText) {
+				return fmt.Errorf("--seller must be a 20-byte hex address")
+			}
+			if !common.IsHexAddress(validatorAddressText) {
+				return fmt.Errorf("--validator must be a 20-byte hex address")
+			}
+			if approvalTimeoutSeconds <= 0 {
+				return fmt.Errorf("--approval-timeout must be greater than 0")
+			}
+
+			requestBody, err := readTextOrFile(requestText, requestFile, "request")
+			if err != nil {
+				return err
+			}
+
+			privateKey, err := loadBuyerPrivateKey()
+			if err != nil {
+				return err
+			}
+			buyerAddress := crypto.PubkeyToAddress(privateKey.PublicKey)
+
+			ctx := cmd.Context()
+			db, err := store.Open(cfg.DBPath)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+
+			activeMarkets, err := db.ListActiveMarkets(ctx)
+			if err != nil {
+				return err
+			}
+			if len(activeMarkets) == 0 {
+				return fmt.Errorf("no active market configured; run `agent-nexus market use --name <name>` first")
+			}
+			if len(activeMarkets) > 1 {
+				return fmt.Errorf("multiple active markets configured; deactivate all but one before creating an order")
+			}
+			activeMarket := activeMarkets[0]
+
+			market, err := chain.NewMarketClientWithPrivateKey(ctx, activeMarket.RPCURL, activeMarket.MarketAddress, privateKey)
+			if err != nil {
+				return err
+			}
+			defer market.Close()
+
+			sellerAddress := common.HexToAddress(sellerAddressText)
+			validatorAddress := common.HexToAddress(validatorAddressText)
+
+			seller, err := market.GetSeller(ctx, sellerAddress)
+			if err != nil {
+				return err
+			}
+			if !seller.Registered || !seller.Active {
+				return fmt.Errorf("seller is not registered and active: %s", sellerAddress.Hex())
+			}
+			if strings.TrimSpace(seller.SellerURI) == "" {
+				return fmt.Errorf("sellerURI is required for seller: %s", sellerAddress.Hex())
+			}
+
+			validator, err := market.GetValidator(ctx, validatorAddress)
+			if err != nil {
+				return err
+			}
+			if !validator.Registered || !validator.Active {
+				return fmt.Errorf("validator is not registered and active: %s", validatorAddress.Hex())
+			}
+
+			requestHash := agentcrypto.Keccak256Hex([]byte(requestBody))
+			requestHashBytes, err := bytes32FromHex(requestHash)
+			if err != nil {
+				return err
+			}
+
+			value := new(big.Int).Add(new(big.Int).Set(seller.Price), validator.Fee)
+			createResult, err := market.CreateOrder(
+				ctx,
+				sellerAddress,
+				validatorAddress,
+				requestHashBytes,
+				big.NewInt(approvalTimeoutSeconds),
+				value,
+			)
+			if err != nil {
+				return err
+			}
+
+			order, err := db.CreateOrder(ctx, store.CreateOrderInput{
+				RPCURL:         activeMarket.RPCURL,
+				MarketAddress:  activeMarket.MarketAddress,
+				ChainOrderID:   createResult.OrderID,
+				BuyerAddress:   buyerAddress.Hex(),
+				SellerURI:      seller.SellerURI,
+				ValidatorURI:   validator.ValidatorURI,
+				RequestContent: requestBody,
+				Status:         "PendingSeller",
+			})
+			if err != nil {
+				return err
+			}
+
+			message := agentcrypto.OrderRequestMessage(market.Address(), createResult.OrderID, requestHash)
+			signature, err := agentcrypto.SignPersonalMessage(privateKey, message)
+			if err != nil {
+				return err
+			}
+
+			endpoint, err := orderRequestEndpoint(seller.SellerURI)
+			if err != nil {
+				return err
+			}
+
+			sellerResponse, err := submitOrderRequest(ctx, endpoint, orderRequestPayload{
+				MarketAddress: activeMarket.MarketAddress,
+				OrderID:       createResult.OrderID.String(),
+				Request:       requestBody,
+				Signature:     signature,
+			})
+			if err != nil {
+				return fmt.Errorf("submit request to seller after local order %d was saved: %w", order.ID, err)
+			}
+			if err := db.UpdateOrderStatus(ctx, order.ID, "SellerConfirmed"); err != nil {
+				return err
+			}
+			order.Status = "SellerConfirmed"
+
+			return writeJSON(cmd, map[string]any{
+				"status":                 "seller_confirmed",
+				"order":                  order,
+				"buyerAddress":           buyerAddress.Hex(),
+				"sellerAddress":          sellerAddress.Hex(),
+				"validatorAddress":       validatorAddress.Hex(),
+				"requestHash":            requestHash,
+				"paymentWei":             value.String(),
+				"createOrderTxHash":      createResult.TxHash,
+				"sellerRequestEndpoint":  endpoint,
+				"sellerRequestSubmitted": true,
+				"sellerResponse":         sellerResponse,
+			})
+		},
+	}
+
+	cmd.Flags().StringVar(&sellerAddressText, "seller", "", "seller wallet address")
+	cmd.Flags().StringVar(&validatorAddressText, "validator", "", "validator wallet address")
+	cmd.Flags().StringVar(&requestText, "request", "", "buyer request text")
+	cmd.Flags().StringVar(&requestFile, "request-file", "", "buyer request file")
+	cmd.Flags().Int64Var(&approvalTimeoutSeconds, "approval-timeout", 31536000, "approval timeout in seconds")
 	return cmd
 }
 
@@ -276,6 +440,22 @@ func deliveryEndpoint(sellerURI string) (string, error) {
 	return base.String(), nil
 }
 
+func orderRequestEndpoint(sellerURI string) (string, error) {
+	base, err := url.Parse(strings.TrimSpace(sellerURI))
+	if err != nil {
+		return "", fmt.Errorf("parse sellerURI: %w", err)
+	}
+	if base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("sellerURI must be an absolute HTTP URL")
+	}
+
+	path := strings.TrimRight(base.Path, "/") + "/agent-nexus/request"
+	base.Path = path
+	base.RawQuery = ""
+	base.Fragment = ""
+	return base.String(), nil
+}
+
 func disputeEndpoint(validatorURI string) (string, error) {
 	base, err := url.Parse(strings.TrimSpace(validatorURI))
 	if err != nil {
@@ -292,6 +472,13 @@ func disputeEndpoint(validatorURI string) (string, error) {
 	return base.String(), nil
 }
 
+type orderRequestPayload struct {
+	MarketAddress string `json:"marketAddress"`
+	OrderID       string `json:"orderId"`
+	Request       string `json:"request"`
+	Signature     string `json:"signature"`
+}
+
 type disputeEvidenceRequest struct {
 	MarketAddress string `json:"marketAddress"`
 	OrderID       string `json:"orderId"`
@@ -300,6 +487,41 @@ type disputeEvidenceRequest struct {
 	Delivery      string `json:"delivery"`
 	Dispute       string `json:"dispute"`
 	Signature     string `json:"signature"`
+}
+
+func submitOrderRequest(ctx context.Context, endpoint string, payload orderRequestPayload) (map[string]any, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode order request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("submit order request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read order request response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("order request failed: status=%d body=%s", resp.StatusCode, string(responseBody))
+	}
+
+	var response map[string]any
+	if len(bytes.TrimSpace(responseBody)) == 0 {
+		return map[string]any{}, nil
+	}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return nil, fmt.Errorf("decode order request response: %w", err)
+	}
+	return response, nil
 }
 
 func submitDisputeEvidence(ctx context.Context, endpoint string, payload disputeEvidenceRequest) error {
@@ -334,6 +556,16 @@ func submitDisputeEvidence(ctx context.Context, endpoint string, payload dispute
 	}
 
 	return nil
+}
+
+func bytes32FromHex(value string) ([32]byte, error) {
+	var out [32]byte
+	data := common.FromHex(value)
+	if len(data) != 32 {
+		return out, fmt.Errorf("expected bytes32 hex value, got %s", value)
+	}
+	copy(out[:], data)
+	return out, nil
 }
 
 func readTextOrFile(text string, path string, name string) (string, error) {

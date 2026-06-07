@@ -29,6 +29,7 @@ const marketABIJSON = `[
           {"internalType": "address", "name": "validator", "type": "address"},
           {"internalType": "uint256", "name": "amount", "type": "uint256"},
           {"internalType": "uint256", "name": "validatorFee", "type": "uint256"},
+          {"internalType": "uint256", "name": "validatorBond", "type": "uint256"},
           {"internalType": "bytes32", "name": "listingHash", "type": "bytes32"},
           {"internalType": "bytes32", "name": "requestHash", "type": "bytes32"},
           {"internalType": "bytes32", "name": "deliveryHash", "type": "bytes32"},

@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -45,6 +46,26 @@ const marketABIJSON = `[
     "type": "function"
   },
   {
+    "inputs": [{"internalType": "address", "name": "validator", "type": "address"}],
+    "name": "getValidator",
+    "outputs": [
+      {"internalType": "bool", "name": "registered", "type": "bool"},
+      {"internalType": "bool", "name": "active", "type": "bool"},
+      {"internalType": "string", "name": "validatorURI", "type": "string"},
+      {"internalType": "uint256", "name": "fee", "type": "uint256"},
+      {"internalType": "uint256", "name": "responseTimeout", "type": "uint256"}
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getOrderCount",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [{"internalType": "uint256", "name": "orderId", "type": "uint256"}],
     "name": "getOrder",
     "outputs": [
@@ -55,6 +76,7 @@ const marketABIJSON = `[
           {"internalType": "address", "name": "validator", "type": "address"},
           {"internalType": "uint256", "name": "amount", "type": "uint256"},
           {"internalType": "uint256", "name": "validatorFee", "type": "uint256"},
+          {"internalType": "uint256", "name": "validatorBond", "type": "uint256"},
           {"internalType": "bytes32", "name": "listingHash", "type": "bytes32"},
           {"internalType": "bytes32", "name": "requestHash", "type": "bytes32"},
           {"internalType": "bytes32", "name": "deliveryHash", "type": "bytes32"},
@@ -71,6 +93,18 @@ const marketABIJSON = `[
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "address", "name": "seller", "type": "address"},
+      {"internalType": "address", "name": "validator", "type": "address"},
+      {"internalType": "bytes32", "name": "requestHash", "type": "bytes32"},
+      {"internalType": "uint256", "name": "approvalTimeout", "type": "uint256"}
+    ],
+    "name": "createOrder",
+    "outputs": [{"internalType": "uint256", "name": "orderId", "type": "uint256"}],
+    "stateMutability": "payable",
     "type": "function"
   },
   {
@@ -101,6 +135,20 @@ type Seller struct {
 	ContentURI      string
 	ContentHash     string
 	DeliveryTimeout *big.Int
+}
+
+type Validator struct {
+	Address         common.Address
+	Registered      bool
+	Active          bool
+	ValidatorURI    string
+	Fee             *big.Int
+	ResponseTimeout *big.Int
+}
+
+type CreateOrderResult struct {
+	OrderID *big.Int
+	TxHash  string
 }
 
 type Order struct {
@@ -184,6 +232,36 @@ func (m *MarketClient) GetSeller(ctx context.Context, seller common.Address) (Se
 	}, nil
 }
 
+func (m *MarketClient) GetValidator(ctx context.Context, validator common.Address) (Validator, error) {
+	outputs, err := m.call(ctx, "getValidator", validator)
+	if err != nil {
+		return Validator{}, err
+	}
+
+	return Validator{
+		Address:         validator,
+		Registered:      outputs[0].(bool),
+		Active:          outputs[1].(bool),
+		ValidatorURI:    outputs[2].(string),
+		Fee:             outputs[3].(*big.Int),
+		ResponseTimeout: outputs[4].(*big.Int),
+	}, nil
+}
+
+func (m *MarketClient) GetOrderCount(ctx context.Context) (*big.Int, error) {
+	outputs, err := m.call(ctx, "getOrderCount")
+	if err != nil {
+		return nil, err
+	}
+
+	count, ok := outputs[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("decode getOrderCount output")
+	}
+
+	return count, nil
+}
+
 func (m *MarketClient) GetOrder(ctx context.Context, orderID *big.Int) (Order, error) {
 	outputs, err := m.call(ctx, "getOrder", orderID)
 	if err != nil {
@@ -206,6 +284,37 @@ func (m *MarketClient) GetOrder(ctx context.Context, orderID *big.Int) (Order, e
 		DeliveryHash: bytes32Hex(value.FieldByName("DeliveryHash").Interface().([32]byte)),
 		Status:       value.FieldByName("Status").Interface().(uint8),
 	}, nil
+}
+
+func (m *MarketClient) CreateOrder(ctx context.Context, seller common.Address, validator common.Address, requestHash [32]byte, approvalTimeout *big.Int, value *big.Int) (CreateOrderResult, error) {
+	before, err := m.GetOrderCount(ctx)
+	if err != nil {
+		return CreateOrderResult{}, err
+	}
+
+	input, err := m.abi.Pack("createOrder", seller, validator, requestHash, approvalTimeout)
+	if err != nil {
+		return CreateOrderResult{}, fmt.Errorf("pack createOrder: %w", err)
+	}
+
+	txHash, err := m.sendTransactionWithValue(ctx, input, value)
+	if err != nil {
+		return CreateOrderResult{}, err
+	}
+	if err := m.waitTransactionMined(ctx, txHash, 30*time.Second); err != nil {
+		return CreateOrderResult{}, err
+	}
+
+	after, err := m.GetOrderCount(ctx)
+	if err != nil {
+		return CreateOrderResult{}, err
+	}
+	want := new(big.Int).Add(before, big.NewInt(1))
+	if after.Cmp(want) != 0 {
+		return CreateOrderResult{}, fmt.Errorf("order count mismatch after createOrder: got %s want %s", after.String(), want.String())
+	}
+
+	return CreateOrderResult{OrderID: after, TxHash: txHash}, nil
 }
 
 func (m *MarketClient) OpenDispute(ctx context.Context, orderID *big.Int) (string, error) {
@@ -243,8 +352,15 @@ func (m *MarketClient) call(ctx context.Context, method string, args ...any) ([]
 }
 
 func (m *MarketClient) sendTransaction(ctx context.Context, input []byte) (string, error) {
+	return m.sendTransactionWithValue(ctx, input, big.NewInt(0))
+}
+
+func (m *MarketClient) sendTransactionWithValue(ctx context.Context, input []byte, value *big.Int) (string, error) {
 	if m.privateKey == nil {
 		return "", fmt.Errorf("private key is required for transaction")
+	}
+	if value == nil {
+		value = big.NewInt(0)
 	}
 
 	from := gethcrypto.PubkeyToAddress(m.privateKey.PublicKey)
@@ -261,15 +377,16 @@ func (m *MarketClient) sendTransaction(ctx context.Context, input []byte) (strin
 		return "", fmt.Errorf("suggest gas price: %w", err)
 	}
 	gasLimit, err := m.client.EstimateGas(ctx, ethereum.CallMsg{
-		From: from,
-		To:   &m.marketAddress,
-		Data: input,
+		From:  from,
+		To:    &m.marketAddress,
+		Value: value,
+		Data:  input,
 	})
 	if err != nil {
 		return "", fmt.Errorf("estimate gas: %w", err)
 	}
 
-	tx := types.NewTransaction(nonce, m.marketAddress, big.NewInt(0), gasLimit, gasPrice, input)
+	tx := types.NewTransaction(nonce, m.marketAddress, value, gasLimit, gasPrice, input)
 	signedTx, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), m.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("sign transaction: %w", err)
@@ -279,6 +396,32 @@ func (m *MarketClient) sendTransaction(ctx context.Context, input []byte) (strin
 	}
 
 	return signedTx.Hash().Hex(), nil
+}
+
+func (m *MarketClient) waitTransactionMined(ctx context.Context, txHash string, timeout time.Duration) error {
+	hash := common.HexToHash(txHash)
+	deadline := time.Now().Add(timeout)
+	for {
+		receipt, err := m.client.TransactionReceipt(ctx, hash)
+		if err == nil {
+			if receipt.Status != types.ReceiptStatusSuccessful {
+				return fmt.Errorf("transaction reverted: %s", txHash)
+			}
+			return nil
+		}
+		if err != ethereum.NotFound {
+			return fmt.Errorf("read transaction receipt: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for transaction: %s", txHash)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func bytes32Hex(value [32]byte) string {

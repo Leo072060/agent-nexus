@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -13,15 +14,6 @@ import (
 
 type Store struct {
 	db *sql.DB
-}
-
-type Delivery struct {
-	ID           int64
-	ChainOrderID *big.Int
-	DeliveryHash string
-	DeliveryBody []byte
-	CreatedAt    string
-	UpdatedAt    string
 }
 
 type Order struct {
@@ -36,6 +28,11 @@ type Order struct {
 	DeliveryHash         string
 	DeliveryBody         []byte
 	CommitDeliveryTxHash string
+	EvidenceHash         string
+	EvidenceBody         []byte
+	EvidenceSentAt       string
+	EvidencePostStatus   int
+	EvidencePostResponse string
 	Status               string
 	CreatedAt            string
 	UpdatedAt            string
@@ -66,15 +63,6 @@ func (s *Store) Close() error {
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS deliveries (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	chain_order_id TEXT NOT NULL UNIQUE,
-	delivery_hash TEXT NOT NULL,
-	delivery_body BLOB NOT NULL,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS orders (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	chain_order_id TEXT NOT NULL UNIQUE,
@@ -87,6 +75,11 @@ CREATE TABLE IF NOT EXISTS orders (
 	delivery_hash TEXT NOT NULL DEFAULT '',
 	delivery_body BLOB,
 	commit_delivery_tx_hash TEXT NOT NULL DEFAULT '',
+	evidence_hash TEXT NOT NULL DEFAULT '',
+	evidence_body BLOB,
+	evidence_sent_at TEXT NOT NULL DEFAULT '',
+	evidence_post_status INTEGER NOT NULL DEFAULT 0,
+	evidence_post_response TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
@@ -96,63 +89,19 @@ CREATE TABLE IF NOT EXISTS orders (
 		return fmt.Errorf("migrate database: %w", err)
 	}
 
+	for _, statement := range []string{
+		`ALTER TABLE orders ADD COLUMN evidence_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN evidence_body BLOB`,
+		`ALTER TABLE orders ADD COLUMN evidence_sent_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE orders ADD COLUMN evidence_post_status INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE orders ADD COLUMN evidence_post_response TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil && !isDuplicateColumn(err) {
+			return fmt.Errorf("migrate database: %w", err)
+		}
+	}
+
 	return nil
-}
-
-func (s *Store) UpsertDelivery(ctx context.Context, chainOrderID *big.Int, deliveryHash string, body []byte) (Delivery, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	chainOrderIDText := chainOrderID.String()
-
-	_, err := s.db.ExecContext(
-		ctx,
-		`INSERT INTO deliveries (chain_order_id, delivery_hash, delivery_body, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(chain_order_id) DO UPDATE SET
-	delivery_hash = excluded.delivery_hash,
-	delivery_body = excluded.delivery_body,
-	updated_at = excluded.updated_at`,
-		chainOrderIDText,
-		deliveryHash,
-		body,
-		now,
-		now,
-	)
-	if err != nil {
-		return Delivery{}, fmt.Errorf("upsert delivery: %w", err)
-	}
-
-	return s.GetDelivery(ctx, chainOrderID)
-}
-
-func (s *Store) GetDelivery(ctx context.Context, chainOrderID *big.Int) (Delivery, error) {
-	var delivery Delivery
-	var chainOrderIDText string
-	err := s.db.QueryRowContext(
-		ctx,
-		`SELECT id, chain_order_id, delivery_hash, delivery_body, created_at, updated_at FROM deliveries WHERE chain_order_id = ?`,
-		chainOrderID.String(),
-	).Scan(
-		&delivery.ID,
-		&chainOrderIDText,
-		&delivery.DeliveryHash,
-		&delivery.DeliveryBody,
-		&delivery.CreatedAt,
-		&delivery.UpdatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Delivery{}, fmt.Errorf("delivery not found: %s", chainOrderID.String())
-	}
-	if err != nil {
-		return Delivery{}, fmt.Errorf("get delivery: %w", err)
-	}
-
-	parsedID, ok := new(big.Int).SetString(chainOrderIDText, 10)
-	if !ok {
-		return Delivery{}, fmt.Errorf("invalid stored chain_order_id: %s", chainOrderIDText)
-	}
-	delivery.ChainOrderID = parsedID
-
-	return delivery, nil
 }
 
 func (s *Store) UpsertOrderRequest(
@@ -210,19 +159,42 @@ func (s *Store) MarkSellerConfirmed(ctx context.Context, chainOrderID *big.Int, 
 	return s.updateOrder(ctx, chainOrderID, `confirm_seller_tx_hash = ?, status = ?`, txHash, "seller_confirmed")
 }
 
-func (s *Store) MarkDeliveryCommitted(ctx context.Context, chainOrderID *big.Int, deliveryHash string, deliveryBody []byte, txHash string) error {
-	if _, err := s.UpsertDelivery(ctx, chainOrderID, deliveryHash, deliveryBody); err != nil {
-		return err
-	}
-
+func (s *Store) MarkDeliveryGenerated(ctx context.Context, chainOrderID *big.Int, deliveryHash string, deliveryBody []byte, evidenceHash string, evidenceBody []byte) error {
 	return s.updateOrder(
 		ctx,
 		chainOrderID,
-		`delivery_hash = ?, delivery_body = ?, commit_delivery_tx_hash = ?, status = ?`,
+		`delivery_hash = ?, delivery_body = ?, evidence_hash = ?, evidence_body = ?, status = ?`,
 		deliveryHash,
 		deliveryBody,
+		evidenceHash,
+		evidenceBody,
+		"delivery_generated",
+	)
+}
+
+func (s *Store) MarkDeliveryCommitted(ctx context.Context, chainOrderID *big.Int, deliveryHash string, deliveryBody []byte, evidenceHash string, evidenceBody []byte, txHash string) error {
+	return s.updateOrder(
+		ctx,
+		chainOrderID,
+		`delivery_hash = ?, delivery_body = ?, evidence_hash = ?, evidence_body = ?, commit_delivery_tx_hash = ?, status = ?`,
+		deliveryHash,
+		deliveryBody,
+		evidenceHash,
+		evidenceBody,
 		txHash,
 		"delivery_committed",
+	)
+}
+
+func (s *Store) MarkEvidencePosted(ctx context.Context, chainOrderID *big.Int, httpStatus int, responseBody string) error {
+	return s.updateOrder(
+		ctx,
+		chainOrderID,
+		`evidence_sent_at = ?, evidence_post_status = ?, evidence_post_response = ?, status = ?`,
+		time.Now().UTC().Format(time.RFC3339),
+		httpStatus,
+		responseBody,
+		"evidence_sent",
 	)
 }
 
@@ -230,6 +202,7 @@ func (s *Store) GetOrder(ctx context.Context, chainOrderID *big.Int) (Order, err
 	var order Order
 	var chainOrderIDText string
 	var deliveryBody []byte
+	var evidenceBody []byte
 	err := s.db.QueryRowContext(
 		ctx,
 		`SELECT
@@ -244,6 +217,11 @@ func (s *Store) GetOrder(ctx context.Context, chainOrderID *big.Int) (Order, err
 	delivery_hash,
 	delivery_body,
 	commit_delivery_tx_hash,
+	evidence_hash,
+	evidence_body,
+	evidence_sent_at,
+	evidence_post_status,
+	evidence_post_response,
 	status,
 	created_at,
 	updated_at
@@ -261,6 +239,11 @@ FROM orders WHERE chain_order_id = ?`,
 		&order.DeliveryHash,
 		&deliveryBody,
 		&order.CommitDeliveryTxHash,
+		&order.EvidenceHash,
+		&evidenceBody,
+		&order.EvidenceSentAt,
+		&order.EvidencePostStatus,
+		&order.EvidencePostResponse,
 		&order.Status,
 		&order.CreatedAt,
 		&order.UpdatedAt,
@@ -278,6 +261,7 @@ FROM orders WHERE chain_order_id = ?`,
 	}
 	order.ChainOrderID = parsedID
 	order.DeliveryBody = deliveryBody
+	order.EvidenceBody = evidenceBody
 
 	return order, nil
 }
@@ -302,4 +286,8 @@ func (s *Store) updateOrder(ctx context.Context, chainOrderID *big.Int, setClaus
 	}
 
 	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
 }

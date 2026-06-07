@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"math/big"
@@ -27,6 +28,27 @@ func OrderRequestMessage(marketAddress common.Address, orderID *big.Int, request
 		orderID.String(),
 		strings.ToLower(requestHash),
 	)
+}
+
+func EvidenceMessage(marketAddress common.Address, orderID *big.Int, requestHash string, deliveryHash string, evidenceHash string) string {
+	return fmt.Sprintf(
+		"Agent Nexus seller evidence\nmarketAddress: %s\norderId: %s\nrequestHash: %s\ndeliveryHash: %s\nevidenceHash: %s",
+		marketAddress.Hex(),
+		orderID.String(),
+		strings.ToLower(requestHash),
+		strings.ToLower(deliveryHash),
+		strings.ToLower(evidenceHash),
+	)
+}
+
+func SignMessage(privateKey *ecdsa.PrivateKey, message string) (string, error) {
+	hash := gethcrypto.Keccak256Hash([]byte("\x19Ethereum Signed Message:\n" + strconv.Itoa(len(message)) + message))
+	signature, err := gethcrypto.Sign(hash.Bytes(), privateKey)
+	if err != nil {
+		return "", fmt.Errorf("sign message: %w", err)
+	}
+	signature[64] += 27
+	return "0x" + common.Bytes2Hex(signature), nil
 }
 
 func RecoverSigner(message string, signatureHex string) (common.Address, error) {

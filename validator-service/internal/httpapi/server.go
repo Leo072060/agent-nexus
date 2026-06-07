@@ -2,12 +2,15 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"agent-nexus-validator-service/internal/chain"
 	"agent-nexus-validator-service/internal/config"
@@ -47,6 +50,7 @@ type Handler struct {
 	market   MarketClient
 	store    DisputeStore
 	decision DecisionMaker
+	auth     *nonceStore
 	mux      *http.ServeMux
 }
 
@@ -68,6 +72,26 @@ type meResponse struct {
 	ValidatorAddress string `json:"validatorAddress"`
 	MarketAddress    string `json:"marketAddress"`
 	BaseURL          string `json:"baseURL"`
+}
+
+type nonceResponse struct {
+	Address   string `json:"address"`
+	OrderID   string `json:"orderId"`
+	Nonce     string `json:"nonce"`
+	Message   string `json:"message"`
+	ExpiresAt string `json:"expiresAt"`
+}
+
+type nonceRecord struct {
+	Address   common.Address
+	OrderID   string
+	ExpiresAt time.Time
+}
+
+type nonceStore struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	records map[string]nonceRecord
 }
 
 // disputeSummary is the public-shaped view of a stored dispute used in list responses.
@@ -109,11 +133,13 @@ func NewHandler(cfg config.Config, market MarketClient, store DisputeStore, deci
 		market:   market,
 		store:    store,
 		decision: decision,
+		auth:     newNonceStore(10 * time.Minute),
 		mux:      http.NewServeMux(),
 	}
 
 	handler.mux.HandleFunc("GET /health", handler.handleHealth)
 	handler.mux.HandleFunc("GET /agent-nexus/me", handler.handleMe)
+	handler.mux.HandleFunc("GET /agent-nexus/auth/nonce", handler.handleAuthNonce)
 	handler.mux.HandleFunc("GET /agent-nexus/disputes", handler.handleListDisputes)
 	handler.mux.HandleFunc("GET /agent-nexus/disputes/{orderId}", handler.handleGetDispute)
 	handler.mux.HandleFunc("POST /agent-nexus/disputes", handler.handleDispute)
@@ -139,6 +165,34 @@ func (h *Handler) handleMe(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (h *Handler) handleAuthNonce(w http.ResponseWriter, r *http.Request) {
+	addressText := strings.TrimSpace(r.URL.Query().Get("address"))
+	if !common.IsHexAddress(addressText) {
+		writeJSONError(w, http.StatusBadRequest, "invalid address")
+		return
+	}
+	orderID, err := parseOrderID(r.URL.Query().Get("orderId"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	address := common.HexToAddress(addressText)
+	nonce, expiresAt, err := h.auth.issue(address, orderID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	message := agentcrypto.DisputeDetailAuthMessage(h.cfg.MarketAddress, orderID, address, nonce)
+	writeJSON(w, http.StatusOK, nonceResponse{
+		Address:   address.Hex(),
+		OrderID:   orderID.String(),
+		Nonce:     nonce,
+		Message:   message,
+		ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
 // handleListDisputes returns the summaries of every dispute this validator processed.
 func (h *Handler) handleListDisputes(w http.ResponseWriter, r *http.Request) {
 	disputes, err := h.store.ListDisputes(r.Context())
@@ -160,6 +214,38 @@ func (h *Handler) handleGetDispute(w http.ResponseWriter, r *http.Request) {
 	orderID, err := parseOrderID(r.PathValue("orderId"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	addressText := strings.TrimSpace(r.URL.Query().Get("address"))
+	nonce := strings.TrimSpace(r.URL.Query().Get("nonce"))
+	signature := strings.TrimSpace(r.URL.Query().Get("signature"))
+	if !common.IsHexAddress(addressText) || nonce == "" || signature == "" {
+		writeJSONError(w, http.StatusUnauthorized, "address, nonce, and signature are required")
+		return
+	}
+	address := common.HexToAddress(addressText)
+	if err := h.auth.consume(address, orderID, nonce); err != nil {
+		writeJSONError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	message := agentcrypto.DisputeDetailAuthMessage(h.cfg.MarketAddress, orderID, address, nonce)
+	signer, err := agentcrypto.RecoverSigner(message, signature)
+	if err != nil {
+		writeJSONError(w, http.StatusUnauthorized, fmt.Sprintf("invalid signature: %v", err))
+		return
+	}
+	if signer != address {
+		writeJSONError(w, http.StatusUnauthorized, "signature signer does not match address")
+		return
+	}
+
+	order, err := h.market.GetOrder(r.Context(), orderID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("read order: %v", err))
+		return
+	}
+	if signer != order.Buyer && signer != order.Seller && signer != order.Validator {
+		writeJSONError(w, http.StatusForbidden, "signature signer is not an order participant")
 		return
 	}
 
@@ -321,6 +407,50 @@ func parseOrderID(value string) (*big.Int, error) {
 	return orderID, nil
 }
 
+func newNonceStore(ttl time.Duration) *nonceStore {
+	return &nonceStore{
+		ttl:     ttl,
+		records: make(map[string]nonceRecord),
+	}
+}
+
+func (s *nonceStore) issue(address common.Address, orderID *big.Int) (string, time.Time, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", time.Time{}, fmt.Errorf("generate nonce: %w", err)
+	}
+	nonce := "0x" + common.Bytes2Hex(raw[:])
+	expiresAt := time.Now().Add(s.ttl).UTC()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records[nonce] = nonceRecord{
+		Address:   address,
+		OrderID:   orderID.String(),
+		ExpiresAt: expiresAt,
+	}
+	return nonce, expiresAt, nil
+}
+
+func (s *nonceStore) consume(address common.Address, orderID *big.Int, nonce string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	record, ok := s.records[nonce]
+	if !ok {
+		return errors.New("nonce not found or already used")
+	}
+	delete(s.records, nonce)
+
+	if time.Now().After(record.ExpiresAt) {
+		return errors.New("nonce expired")
+	}
+	if record.Address != address || record.OrderID != orderID.String() {
+		return errors.New("nonce does not match request")
+	}
+	return nil
+}
+
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
 }
@@ -372,9 +502,8 @@ func toDisputeDetail(dispute store.Dispute) disputeDetail {
 	return detail
 }
 
-// withCORS allows the read-only dashboard (a separate origin, e.g. the Vite dev server)
-// to call these endpoints from a browser. Permissive origin is acceptable because every
-// route is read-only and unauthenticated; OPTIONS preflight is short-circuited here.
+// withCORS allows the browser frontend (a separate origin, e.g. the Vite dev server)
+// to call the validator API. Private detail routes still require wallet signatures.
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")

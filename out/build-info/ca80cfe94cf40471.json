@@ -1,0 +1,1 @@
+{"id":"ca80cfe94cf40471","source_id_to_path":{"0":"contracts/Market.sol","1":"contracts/market/MarketStorage.sol","2":"contracts/market/OrderModule.sol","3":"contracts/market/SellerModule.sol","4":"contracts/market/ValidatorModule.sol"},"language":"Solidity"}

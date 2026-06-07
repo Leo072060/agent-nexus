@@ -23,6 +23,16 @@ func DisputeEvidenceMessage(marketAddress common.Address, orderID *big.Int, requ
 	)
 }
 
+func DisputeDetailAuthMessage(marketAddress common.Address, orderID *big.Int, address common.Address, nonce string) string {
+	return fmt.Sprintf(
+		"Agent Nexus dispute detail\nmarketAddress: %s\norderId: %s\naddress: %s\nnonce: %s",
+		marketAddress.Hex(),
+		orderID.String(),
+		address.Hex(),
+		nonce,
+	)
+}
+
 func RecoverSigner(message string, signatureHex string) (common.Address, error) {
 	signature := common.FromHex(signatureHex)
 	if len(signature) != 65 {
